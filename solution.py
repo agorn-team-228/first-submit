@@ -1,7 +1,10 @@
-"""Минимальный пример сабмита ПСБ: embeddings + rerank + LLM.
+"""Сабмит ПСБ: embeddings + rerank + LLM + структурный чанкинг базы знаний.
 
-Это учебный каркас, а не полноценное RAG-решение: используется только
-простой поиск по словам среди документов и короткие текстовые фрагменты.
+Доработка базового каркаса:
+- документы режутся на чанки ~250 токенов по заголовкам (главы/статьи/markdown);
+- каждый чанк несёт "хлебную крошку" документ > глава > статья (источник для юриста);
+- слова чанков кэшируются (лимит 20 минут на прогон);
+- формат данных list[(name, text)] не меняется — retrieval работает поверх чанков.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import sys
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -63,7 +67,10 @@ FALLBACK = "Не удалось получить ответ."
 WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]{4,}")
 
 
+@lru_cache(maxsize=200_000)
 def words(text: str) -> set[str]:
+    # Кэш: чанки не меняются между вопросами, слова считаем один раз (лимит 20 мин).
+    # Возвращаемое множество НЕ мутировать (используется только через &).
     return set(WORD_RE.findall(text.lower().replace("ё", "е")))
 
 
@@ -129,6 +136,141 @@ def snippet(text: str) -> str:
         if boundary > SNIPPET_CHARS // 2:
             piece = piece[:boundary]
     return piece.strip()
+
+
+# ============ СТРУКТУРНЫЙ ЧАНКИНГ БАЗЫ ЗНАНИЙ (feature/structural-chunking) ============
+# Было: поиску и LLM видны только первые 1200 символов документа (snippet).
+# Стало: документ режется на чанки ~250 токенов по заголовкам (главы/статьи),
+# каждый чанк несёт "хлебную крошку" документ > глава > статья.
+# Формат данных не меняется: list[(name, text)] — весь остальной код работает как раньше.
+
+KB_CHUNK_TOKENS = env_int("KB_CHUNK_TOKENS", 250, 64, 1024)   # платформа не передаёт; тюнинг здесь
+KB_CHUNK_OVERLAP = env_int("KB_CHUNK_OVERLAP", 50, 0, 200)    # 250/50 — стартовые значения из статей
+
+# Шаблоны заголовков: (уровень вложенности, регулярка). Уровень нужен, чтобы
+# "Статья" не затирала "Главу" в хлебной крошке.
+_KB_HEADINGS = [
+    (1, re.compile(r"^#\s+(.+)$")),
+    (2, re.compile(r"^#{2}\s+(.+)$")),
+    (3, re.compile(r"^#{3,6}\s+(.+)$")),
+    (1, re.compile(r"^(?:ЧАСТЬ|Часть)\s+[IVXLCDM\d]+.*$")),
+    (2, re.compile(r"^(?:ГЛАВА|Глава)\s+[IVXLCDM\d]+.*$")),
+    (3, re.compile(r"^(?:РАЗДЕЛ|Раздел)\s+[IVXLCDM\d]+.*$")),
+    (4, re.compile(r"^(?:Статья|Ст\.)\s*\d+(?:\.\d+)*\.?.*$")),
+    (5, re.compile(r"^\d+(?:\.\d+)*\.?\s+\S.{0,120}$")),
+]
+
+
+def _kb_heading(line: str):
+    """Если строка — заголовок, вернуть (уровень, текст), иначе None."""
+    if not line or len(line) > 160:
+        return None
+    for level, pattern in _KB_HEADINGS:
+        m = pattern.match(line)
+        if m:
+            title = m.group(1) if m.groups() else line
+            return level, title.strip().rstrip("#").strip()[:120]
+    # ЗАГОЛОВКИ КАПСОМ (типично для законов), без точки на конце
+    if 8 <= len(line) <= 90 and line == line.upper() and any(c.isalpha() for c in line) and not line.endswith("."):
+        return 2, line.strip()
+    return None
+
+
+def _kb_sections(text: str) -> list[tuple[str, str]]:
+    """Разбить документ на секции по заголовкам. Возвращает [(путь_заголовков, тело)]."""
+    sections = []
+    stack: list[tuple[int, str]] = []
+    buf: list[str] = []
+
+    def flush():
+        body = "\n".join(buf).strip()
+        if body:
+            sections.append((" > ".join(t for _, t in stack), body))
+
+    for line in text.splitlines():
+        h = _kb_heading(line.strip())
+        if h:
+            flush()                      # закрываем ПРЕДЫДУЩУЮ секцию со старым путём
+            buf = [line.strip()]         # сам заголовок оставляем в тексте секции
+            level, title = h
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, title))
+        else:
+            buf.append(line)
+    flush()
+    return sections
+
+
+def _kb_split_fallback(body: str) -> list[str]:
+    """Запасной резак без внешних библиотек: ~3 символа на токен для русского текста."""
+    limit = KB_CHUNK_TOKENS * 3
+    overlap = min(KB_CHUNK_OVERLAP * 3, limit // 2)
+    pieces, start = [], 0
+    while start < len(body):
+        end = min(len(body), start + limit)
+        if end < len(body):              # стараемся резать по границе абзаца/предложения
+            for sep in ("\n\n", "\n", ". ", " "):
+                pos = body.rfind(sep, start + limit // 2, end)
+                if pos != -1:
+                    end = pos + len(sep)
+                    break
+        piece = body[start:end].strip()
+        if piece:
+            pieces.append(piece)
+        if end >= len(body):
+            break
+        start = max(end - overlap, start + 1)
+    return pieces
+
+
+def _kb_make_splitter():
+    """Основной путь: разрешённые langchain-text-splitters + tiktoken (точный счёт токенов)."""
+    try:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        return RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+            encoding_name="cl100k_base",
+            chunk_size=KB_CHUNK_TOKENS,
+            chunk_overlap=min(KB_CHUNK_OVERLAP, KB_CHUNK_TOKENS // 2),
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+    except Exception as exc:             # нет библиотеки / tiktoken оффлайн не скачал словарь
+        print(f"Чанкинг: токенный сплиттер недоступен ({type(exc).__name__}), символьный fallback", file=sys.stderr)
+        return None
+
+
+def build_chunks(documents: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Документы -> чанки с хлебными крошками. Интерфейс совместим со всем остальным кодом."""
+    if CHUNKER.strip().lower() in ("off", "none", "disabled"):
+        return documents                 # платформенный CHUNKER может выключить чанкинг
+    splitter = _kb_make_splitter()
+    chunks: list[tuple[str, str]] = []
+    for name, text in documents:
+        for crumb, body in _kb_sections(text):
+            pieces = None
+            if splitter is not None:
+                try:
+                    pieces = splitter.split_text(body)
+                except Exception:
+                    splitter = None      # один сбой — дальше работаем запасным резаком
+            if pieces is None:
+                pieces = _kb_split_fallback(body)
+            for i, piece in enumerate(pieces, 1):
+                piece = piece.strip()
+                if not piece:
+                    continue
+                label = f"{name} > {crumb}" if crumb else name
+                if len(pieces) > 1:
+                    label += f" [фрагмент {i}/{len(pieces)}]"
+                # крошку кладём и в текст: её видят эмбеддер, реранкер и LLM
+                chunk_text = f"{crumb}\n{piece}" if crumb else piece
+                chunks.append((label, chunk_text))
+    if not chunks:                       # совсем пустая база — не ломаем пайплайн
+        return documents
+    print(f"Чанкинг: {len(documents)} документов -> {len(chunks)} чанков "
+          f"(цель ~{KB_CHUNK_TOKENS} токенов, overlap {KB_CHUNK_OVERLAP})", flush=True)
+    return chunks
+# ======================= КОНЕЦ БЛОКА СТРУКТУРНОГО ЧАНКИНГА =======================
 
 
 def post(client: httpx.Client, path: str, key: str, payload: dict) -> dict:
@@ -236,7 +378,8 @@ def main() -> None:
         raise ValueError("Нужны LLM_BASE_URL и LLM_API_KEY (или их аналоги)")
     questions = load_questions(find_file("questions.csv"))
     documents = load_documents(find_file("kb.zip", "knowledge-base.zip", "knowledge_base.zip"))
-    print(f"Вопросы: {len(questions)}; документы: {len(documents)}; TOP_K={TOP_K}", flush=True)
+    documents = build_chunks(documents)   # структурный чанкинг вместо обрезки первых 1200 символов
+    print(f"Вопросы: {len(questions)}; чанков: {len(documents)}; TOP_K={TOP_K}", flush=True)
 
     def work(position: int, question: str) -> tuple[int, str]:
         try:
