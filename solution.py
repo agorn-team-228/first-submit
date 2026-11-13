@@ -1,715 +1,1393 @@
-"""Минимальный пример сабмита ПСБ: embeddings + rerank + LLM.
-
-Это учебный каркас, а не полноценное RAG-решение: используется только
-простой поиск по словам среди документов и короткие текстовые фрагменты.
+"""ПСБ / Hack&Change 2026 — юридический RAG-ассистент.
+только бы все заработало
+Пайплайн:
+  1. Чтение knowledge-base.zip (docx c таблицами, pdf, html, txt) + questions.csv.
+  2. Структурная нарезка по юридическим единицам (статья / раздел / пункт),
+     метаданные: номер договора, контрагент, редакция, оглавление.
+  3. Гибридный поиск: BM25 (свой, numpy) + BAAI/bge-m3 (FAISS/numpy), RRF.
+  4. Бустинг по контрагенту/номеру договора и по применимой редакции.
+  5. Qwen3 Reranker -> сборка контекста целыми пунктами + каталог базы.
+  6. Генерация строго по контексту + проход-контролёр против выдуманных фактов.
+  7. Инкрементальная запись submission.csv (файл валиден с первой секунды).
 """
-
 from __future__ import annotations
 
 import csv
 import io
-import math
 import os
+import random
 import re
 import sys
+import threading
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
-from xml.etree import ElementTree as ET
 
-import bm25s
-import faiss
 import httpx
 import numpy as np
-import tiktoken
-from bs4 import BeautifulSoup
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pypdf import PdfReader
+
+try:
+    import faiss
+except Exception:
+    faiss = None
 
 
-def env(name: str, default: str = "") -> str:
-    value = os.getenv(name, "").strip()
-    return default if not value or value == name else value
+# --------------------------------------------------------------------------- #
+# Конфигурация (только из окружения, никаких секретов в коде)
+# --------------------------------------------------------------------------- #
+def env(*names: str, default: str = "") -> str:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        val = raw.strip()
+        if val and val != name and val.lower() not in {"none", "null", "-"}:
+            return val
+    return default
 
 
 def env_int(name: str, default: int, low: int, high: int) -> int:
     try:
-        return max(low, min(high, int(env(name))))
-    except ValueError:
+        return max(low, min(high, int(float(env(name, default=str(default))))))
+    except Exception:
         return default
 
 
-def env_float(name: str, default: float) -> float:
+def env_float(name: str, default: float, low: float, high: float) -> float:
     try:
-        return max(0.0, min(2.0, float(env(name))))
-    except ValueError:
+        return max(low, min(high, float(env(name, default=str(default)))))
+    except Exception:
         return default
 
 
-# Настройки приходят с платформы. В ZIP НЕ НУЖНО класть секреты и .env.
-DATA_DIR = Path(env("DATA_DIR", "data"))
-API_BASE = (env("LLM_BASE_URL") or env("BASE_URL") or env("OPENAI_BASE_URL")).rstrip("/")
-LLM_KEY = env("LLM_API_KEY") or env("OPENAI_API_KEY")
+T0 = time.time()
+DATA_DIR = Path(env("DATA_DIR", default="data"))
+API_BASE = env("LLM_BASE_URL", "OPENAI_BASE_URL", "BASE_URL").rstrip("/")
+GEN_MODEL = env("LLM_MODEL", "GEN_MODEL", "OPENAI_MODEL")
+EMB_MODEL = env("EMB_MODEL", "EMBEDDER_MODEL", default="BAAI/bge-m3")
+RERANK_MODEL = env("RERANKER_MODEL", default="Qwen/Qwen3-Reranker-8B")
+
+LLM_KEY = env("LLM_API_KEY", "OPENAI_API_KEY")
 EMBED_KEY = env("EMBEDDER_API_KEY") or LLM_KEY
 RERANK_KEY = env("RERANKER_API_KEY") or LLM_KEY
+API_KEY = LLM_KEY  
 
-LLM_MODEL = env("LLM_MODEL") or env("GEN_MODEL") or env("OPENAI_MODEL", "deepseek/deepseek-v4.1-flash")
-EMB_MODEL = env("EMB_MODEL", "baai/bge-m3")
-RERANKER_MODEL = env("RERANKER_MODEL", "qwen/qwen3-reranker-8b")
+TEMPERATURE = env_float("TEMPERATURE", 0.0, 0.0, 1.0)
+ANSWER_TOKENS = max(512, env_int("MAX_TOKENS", 700, 128, 1600))
+MAX_WORKERS = env_int("MAX_WORKERS", 6, 1, 12)
+TOP_K = env_int("TOP_K", 40, 10, 120)
+RERANK_TOP_N = env_int("RERANKER_TOP_N", 8, 3, 20)
 
-#расширил лимиты для качественного гибридного поиска
-RETRIEVAL_TOP_K = max(30, env_int("TOP_K", 30, 10, 100))
-RERANKER_TOP_N = env_int("RERANKER_TOP_N", 6, 3, 15)
-MAX_TOKENS = env_int("MAX_TOKENS", 600, 128, 8192)
-MAX_WORKERS = env_int("MAX_WORKERS", 4, 1, 16)
-TEMPERATURE = env_float("TEMPERATURE", 0.0)
-CHUNKER = env("CHUNKER", "common")
+RUN_BUDGET = env_int("RUN_BUDGET_SEC", 1020, 60, 1140)   # 17 мин из 20 на всякий случай
+DEADLINE = T0 + RUN_BUDGET
+INDEX_BUDGET = min(420.0, RUN_BUDGET * 0.40)
+CTX_CHARS = env_int("CTX_CHARS", 14000, 3000, 30000)
 
+USE_RERANK = env("USE_RERANK", default="1").lower() not in {"0", "false", "off", "no"}
+USE_VERIFY = env("USE_VERIFY", default="1").lower() not in {"0", "false", "off", "no"}
+USE_EMBED = env("USE_EMBED", default="1").lower() not in {"0", "false", "off", "no"}
+
+CHILD_MAX = 900
+CHILD_OVL = 120
+BLOCK_MAX = 2000
+MAX_EMBED_CHILDREN = env_int("MAX_EMBED_CHILDREN", 16000, 500, 60000)
 
 FALLBACK = (
     "В базе знаний нет документов по данному вопросу, поэтому ответить по документам я не могу. "
-    "По памяти отвечать не буду, так как нормы могли измениться. Для ответа обратитесь к юристу."
+    "По памяти отвечать не буду, так как нормы могли измениться. Для ответа обратитесь в "
+    "юридический отдел или отдел кадров."
 )
 
-#def count_tokens(text: str) -> int:
-#   return len(TOKENIZER.encode(text))
+_LOG_LOCK = threading.Lock()
 
 
-def find_file(*names: str) -> Path:
-    for root in (DATA_DIR, Path(__file__).resolve().parent / DATA_DIR, Path.cwd()):
-        for name in names:
-            path = root / name
-            if path.is_file():
-                return path
-    raise FileNotFoundError(f"Не найден один из файлов: {', '.join(names)}")
+def log(msg: str) -> None:
+    with _LOG_LOCK:
+        print(f"[{time.time() - T0:7.1f}s] {msg}", flush=True)
 
 
-def load_questions(path: Path) -> list[tuple[str, str]]:
-    with path.open(encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        if not reader.fieldnames or not {"id", "question"}.issubset(reader.fieldnames):
-            raise ValueError("В questions.csv нужны колонки id и question")
-        rows = [(str(r["id"]).strip(), str(r["question"]).strip()) for r in reader]
-    if not rows or any(not qid for qid, _ in rows):
-        raise ValueError("В questions.csv отсутствуют вопросы или id")
-    return rows
+def warn(msg: str) -> None:
+    with _LOG_LOCK:
+        print(f"[{time.time() - T0:7.1f}s] WARN {msg}", file=sys.stderr, flush=True)
 
 
-def read_docx(raw: bytes) -> str:
-    # DOCX — это ZIP с XML. Пример обходится без дополнительной библиотеки.
-    with zipfile.ZipFile(io.BytesIO(raw)) as doc:
-        xml = doc.read("word/document.xml")
-    root = ET.fromstring(xml)
-    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    paragraphs = []
-    for p in root.iter(ns + "p"):
-        line = "".join(x.text or "" for x in p.iter(ns + "t")).strip()
-        if line: 
-            paragraphs.append(line)
-    return "\n".join(paragraphs)
-
-#читаем pdf
-def read_pdf(raw: bytes) -> str:
-    reader = PdfReader(io.BytesIO(raw))
-    pages = []
-    for page in reader.pages:
-        txt = page.extract_text() or ""
-        if txt.strip():
-            pages.append(txt.strip())
-    return "\n".join(pages)
-
-#читаем html 
-def read_html(raw: bytes) -> str:
-    soup = BeautifulSoup(raw.decode("utf-8", errors="ignore"), "lxml")
-    return soup.get_text(separator="\n", strip=True)
+def left() -> float:
+    return DEADLINE - time.time()
 
 
+# --------------------------------------------------------------------------- #
+# HTTP-слой: один пул соединений, ограниченные ретраи, учёт дедлайна
+# --------------------------------------------------------------------------- #
+class ApiError(RuntimeError):
+    def __init__(self, msg: str, permanent: bool = False):
+        super().__init__(msg)
+        self.permanent = permanent
 
-def fix_zip_filename(name: str, flag_bits: int) -> str:
-    """Исправляет все виды битых кодировок русских имен файлов в ZIP (CP437/CP866 <-> UTF-8)."""
-    if "╨" in name or "╤" in name:
+
+_CLIENT = None
+_CLIENT_LOCK = threading.Lock()
+
+
+def client() -> httpx.Client:
+    global _CLIENT
+    with _CLIENT_LOCK:
+        if _CLIENT is None:
+            _CLIENT = httpx.Client(
+                timeout=httpx.Timeout(180.0, connect=15.0),
+                limits=httpx.Limits(
+                    max_connections=MAX_WORKERS * 3 + 6,
+                    max_keepalive_connections=MAX_WORKERS * 2 + 4,
+                ),
+                headers={"Authorization": "Bearer " + API_KEY},
+            )
+        return _CLIENT
+
+
+def _bases() -> list[str]:
+    out = [API_BASE]
+    if API_BASE.endswith("/v1"):
+        out.append(API_BASE[:-3])
+    else:
+        out.append(API_BASE + "/v1")
+    return out
+
+
+def post(path: str, payload: dict, *, key: str = "", retries: int = 3,
+         timeout: float = 180.0, deadline: float | None = None) -> dict:
+    auth_key = key or LLM_KEY
+    if not API_BASE or not auth_key:
+        raise ApiError("нет LLM_BASE_URL / LLM_API_KEY", permanent=True)
+    dl = DEADLINE if deadline is None else deadline
+    last: Exception | None = None
+    for base in _bases():
+        for attempt in range(retries):
+            if time.time() > dl - 2:
+                raise ApiError("дедлайн запроса")
+            try:
+                resp = client().post(base + path, json=payload, timeout=timeout,
+                                     headers={"Authorization": "Bearer " + auth_key})
+            except Exception as exc:
+                last = exc
+                time.sleep(min(6.0, 1.0 + attempt) + random.uniform(0, 0.4))
+                continue
+            code = resp.status_code
+            if code == 404:
+                last = ApiError(f"{path} HTTP 404", permanent=True)
+                break
+            if code in (400, 401, 403, 422):
+                raise ApiError(f"{path} HTTP {code}", permanent=True)
+            if code == 429 or code >= 500:
+                try:
+                    wait = float(resp.headers.get("Retry-After", "0"))
+                except Exception:
+                    wait = 0.0
+                wait = max(wait, min(8.0, 1.2 * (2 ** attempt)))
+                last = ApiError(f"{path} HTTP {code}")
+                if attempt < retries - 1 and time.time() + wait < dl - 2:
+                    time.sleep(wait + random.uniform(0, 0.4))
+                    continue
+                break
+            try:
+                return resp.json()
+            except Exception as exc:
+                last = exc
+                break
+    raise last or ApiError(f"{path}: нет ответа")
+
+
+def discover_models() -> None:
+    """Прокси может отдавать ID в другом регистре — берём фактические ID из /models."""
+    global GEN_MODEL, EMB_MODEL, RERANK_MODEL
+    ids: list[str] = []
+    for base in _bases():
         try:
-            return name.encode("cp866").decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            pass
+            resp = client().get(base + "/models", timeout=20.0,
+                                headers={"Authorization": "Bearer " + LLM_KEY})
+            if resp.status_code == 200:
+                items = resp.json().get("data") or []
+                ids = [str(i.get("id", "")) for i in items if isinstance(i, dict)]
+                if ids:
+                    break
+        except Exception:
+            continue
+    if not ids:
+        return
+
+    def pick(pred, current: str) -> str:
+        if current and current in ids:
+            return current
+        cands = [i for i in ids if pred(i.lower())]
+        return cands[0] if cands else current
+
+    GEN_MODEL = pick(lambda s: not any(k in s for k in ("bge", "embed", "rerank", "whisper")), GEN_MODEL)
+    EMB_MODEL = pick(lambda s: "bge" in s or "embed" in s, EMB_MODEL)
+    RERANK_MODEL = pick(lambda s: "rerank" in s, RERANK_MODEL)
+    log(f"модели: gen={GEN_MODEL} | emb={EMB_MODEL} | rerank={RERANK_MODEL}")
+
+
+def chat(messages: list[dict], *, max_tokens: int, temperature: float = 0.0,
+         retries: int = 3, timeout: float = 180.0, deadline: float | None = None) -> str:
+    data = post(
+        "/chat/completions",
+        {"model": GEN_MODEL, "messages": messages,
+         "temperature": temperature, "max_tokens": max_tokens},
+        retries=retries, timeout=timeout, deadline=deadline,
+    )
+    text = ""
+    try:
+        content = data["choices"][0]["message"].get("content")
+        if isinstance(content, list):
+            content = " ".join(
+                str(p.get("text", "")) if isinstance(p, dict) else str(p) for p in content
+            )
+        text = (content or "").strip()
+    except Exception:
+        text = ""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I).strip()
+
+
+def _embed_call(texts: list[str], deadline: float, retries: int = 2) -> np.ndarray:
+    data = post("/embeddings", {"model": EMB_MODEL, "input": texts},
+        key=EMBED_KEY, retries=retries, timeout=180.0, deadline=deadline)
+    items = data.get("data") or []
+    vecs: list = [None] * len(texts)
+    for pos, item in enumerate(items):
+        try:
+            idx = int(item.get("index", pos))
+        except Exception:
+            idx = pos
+        if 0 <= idx < len(texts):
+            vecs[idx] = item.get("embedding")
+    if any(v is None for v in vecs):
+        raise ApiError("неполный ответ /embeddings")
+    arr = np.asarray(vecs, dtype=np.float32)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    return arr / norms
+
+
+def _embed_recursive(texts: list[str], base: int, deadline: float, depth: int = 0) -> list:
+    try:
+        arr = _embed_call(texts, deadline)
+        return [(base + i, arr[i]) for i in range(len(texts))]
+    except ApiError as exc:
+        if exc.permanent:
+            raise
+    except Exception:
+        pass
+    if depth >= 2 or len(texts) <= 1 or time.time() > deadline - 5:
+        return []
+    mid = len(texts) // 2
+    return (_embed_recursive(texts[:mid], base, deadline, depth + 1)
+            + _embed_recursive(texts[mid:], base + mid, deadline, depth + 1))
+
+
+def embed_many(texts: list[str], deadline: float, batch: int = 48, workers: int = 4):
+    pairs: list = []
+    lock = threading.Lock()
+    starts = list(range(0, len(texts), batch))
+
+    def job(start: int) -> None:
+        try:
+            got = _embed_recursive(texts[start:start + batch], start, deadline)
+        except Exception as exc:
+            warn(f"embeddings недоступны: {type(exc).__name__}")
+            got = []
+        if got:
+            with lock:
+                pairs.extend(got)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(job, starts))
+    if not pairs:
+        return [], None
+    pairs.sort(key=lambda p: p[0])
+    ids = [p[0] for p in pairs]
+    matrix = np.vstack([p[1] for p in pairs]).astype(np.float32)
+    return ids, matrix
+
+
+class VecIndex:
+    def __init__(self, ids: list[int], matrix: np.ndarray | None):
+        self.ids = np.asarray(ids, dtype=np.int64)
+        self.matrix = matrix
+        self.index = None
+        if matrix is not None and len(ids) and faiss is not None:
+            try:
+                idx = faiss.IndexFlatIP(matrix.shape[1])
+                idx.add(matrix)
+                self.index = idx
+            except Exception:
+                self.index = None
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def search(self, q: np.ndarray, k: int) -> list[tuple[int, float]]:
+        if self.matrix is None or not len(self.ids):
+            return []
+        k = max(1, min(k, len(self.ids)))
+        if self.index is not None:
+            sims, pos = self.index.search(q.reshape(1, -1), k)
+            return [(int(self.ids[p]), float(s)) for p, s in zip(pos[0], sims[0]) if p >= 0]
+        sims = self.matrix @ q
+        top = np.argsort(-sims)[:k]
+        return [(int(self.ids[p]), float(sims[p])) for p in top]
+
+
+def rerank(query: str, docs_text: list[str], top_n: int, deadline: float) -> list[int]:
+    payload = {"model": RERANK_MODEL, "query": query, "documents": docs_text, "top_n": top_n}
+    try:
+        data = post("/rerank", payload, key=RERANK_KEY, retries=2, timeout=120.0, deadline=deadline)
+    except ApiError as exc:
+        if not exc.permanent:
+            raise
+        data = post("/rerank", {"model": RERANK_MODEL, "query": query, "documents": docs_text},
+        key=RERANK_KEY, retries=1, timeout=120.0, deadline=deadline)
+    items = data.get("results") or data.get("data") or []
+    out: list[int] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            idx = int(it.get("index", -1))
+        except Exception:
+            continue
+        if 0 <= idx < len(docs_text) and idx not in out:
+            out.append(idx)
+    return out[:top_n]
+
+
+# --------------------------------------------------------------------------- #
+# Чтение документов
+# --------------------------------------------------------------------------- #
+def fix_zip_name(name: str, flag_bits: int) -> str:
     if flag_bits & 0x800:
         return name
     try:
-        raw_bytes = name.encode("cp437")
-        for enc in ("utf-8", "cp866", "cp1251"):
-            try:
-                return raw_bytes.decode(enc)
-            except UnicodeDecodeError:
-                continue
+        raw = name.encode("cp437")
     except UnicodeEncodeError:
-        pass
+        return name
+    for enc in ("utf-8", "cp866", "cp1251"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
     return name
 
 
-def load_documents(path: Path) -> list[tuple[str, str]]:
-    documents = []
-    with zipfile.ZipFile(path) as archive:
-        for info in sorted(archive.infolist(), key=lambda x: x.filename):
-            raw_name = info.filename
-            if raw_name.endswith("/") or raw_name.startswith("__MACOSX/"):
+def read_docx(raw: bytes) -> str:
+    """Абзацы И таблицы в порядке следования по документу."""
+    try:
+        import docx
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
+
+        document = docx.Document(io.BytesIO(raw))
+        out: list[str] = []
+        for child in document.element.body.iterchildren():
+            tag = child.tag.split("}")[-1]
+            if tag == "p":
+                text = Paragraph(child, document).text.strip()
+                if text:
+                    out.append(text)
+            elif tag == "tbl":
+                table = Table(child, document)
+                for row in table.rows:
+                    cells = [c.text.strip().replace("\n", " ") for c in row.cells]
+                    line = " | ".join(c for c in cells if c)
+                    if line:
+                        out.append(line)
+        if out:
+            return "\n".join(out)
+    except Exception:
+        pass
+    from xml.etree import ElementTree as ET
+
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        root = ET.fromstring(archive.read("word/document.xml"))
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    lines = []
+    for para in root.iter(ns + "p"):
+        text = "".join(node.text or "" for node in para.iter(ns + "t")).strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def read_pdf(raw: bytes) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(raw))
+    pages = [(page.extract_text() or "").strip() for page in reader.pages]
+    return "\n".join(p for p in pages if p)
+
+
+def read_html(raw: bytes) -> str:
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(raw.decode("utf-8", errors="ignore"), "lxml")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    return soup.get_text(separator="\n", strip=True)
+
+
+def decode_bytes(raw: bytes) -> str:
+    for enc in ("utf-8-sig", "cp1251", "utf-8"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def parse_file(name: str, raw: bytes) -> str:
+    suffix = Path(name).suffix.lower()
+    if suffix == ".docx":
+        text = read_docx(raw)
+    elif suffix == ".pdf":
+        text = read_pdf(raw)
+    elif suffix in {".html", ".htm"}:
+        text = read_html(raw)
+    elif suffix in {".txt", ".md", ".csv", ".json"}:
+        text = decode_bytes(raw)
+    else:
+        return ""
+    text = text.replace("\u00a0", " ").replace("\r", "\n")
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def iter_kb_files(kb_path: Path):
+    if kb_path.is_dir():
+        for path in sorted(kb_path.rglob("*")):
+            if path.is_file():
+                yield str(path.relative_to(kb_path)), path.read_bytes()
+        return
+    with zipfile.ZipFile(kb_path) as archive:
+        for info in sorted(archive.infolist(), key=lambda i: i.filename):
+            if info.filename.endswith("/") or "__MACOSX" in info.filename:
                 continue
-            clean_name = fix_zip_filename(raw_name, info.flag_bits)
-            suffix = Path(clean_name).suffix.lower()
-            raw = archive.read(raw_name)
-            try:
-                if suffix == ".docx":
-                    text = read_docx(raw)
-                elif suffix == ".pdf":
-                    text = read_pdf(raw)
-                elif suffix in {".html", ".htm"}:
-                    text = read_html(raw)
-                elif suffix in {".txt", ".md", ".csv", ".json"}:
-                    text = raw.decode("utf-8-sig", errors="replace")
-                else:
-                    continue
-            except Exception as exc:
-                print(f"Пропущен нечитаемый документ {clean_name}: {type(exc).__name__}", file=sys.stderr)
+            name = fix_zip_name(info.filename, info.flag_bits)
+            if Path(name).name.startswith("."):
                 continue
-
-            cleaned = re.sub(r"\n{3,}", "\n\n", text).strip()
-            if cleaned:
-                documents.append((clean_name, cleaned))
-
-    if not documents:
-        raise ValueError("В архиве базы знаний нет читаемых документов")
-    return documents
+            yield name, archive.read(info.filename)
 
 
+# --------------------------------------------------------------------------- #
+# Метаданные документа
+# --------------------------------------------------------------------------- #
+NUM_RE = re.compile(r"№\s*([A-Za-zА-Яа-я]{0,4}[-–]?\d{1,6}(?:/\d{1,4})?)")
+ORG_RE = re.compile(r"(?:ООО|АО|ПАО|ЗАО|ОАО|ИП)\s*[«\"“]([^»\"”]{2,60})[»\"”]")
+EDITION_RE = re.compile(r"(?:редакци\w*|ред\.)\s*(?:от\s*)?(\d{2}\.\d{2}\.\d{4})", re.I)
+DATE_RE = re.compile(r"\b(\d{2})\.(\d{2})\.(\d{4})\b")
 
 
-
-#безопасная инициализация токенизатора на случай изолированного docker
-try:
-    _TOKENIZER = tiktoken.get_encoding("cl100k_base")
-
-    def count_tockens(text: str) -> int:
-        return len(_TOKENIZER.encode(text))
-except Exception:
-    def count_tockens(text:str) -> int:
-        #для русского текста 1 токен в среднем равен ~3 символам
-        return max(1, len(text) // 3)
+def date_ord(day: str, month: str, year: str) -> int:
+    return int(year) * 10000 + int(month) * 100 + int(day)
 
 
 @dataclass
-class ParentChunk:
-    parent_id: int 
-    doc_name: str
-    header: str
+class Doc:
+    did: int
+    name: str
     text: str
+    kind: str = "other"
+    number: str = ""
+    parties: list[str] = field(default_factory=list)
+    edition: str = ""
+    edition_ord: int = 0
+    family: str = ""
+    outline: str = ""
 
-@dataclass
-class ChildChunk:
-    child_id: int 
-    parent_id: int 
-    doc_name: str
-    header: str
-    text: str
 
-#Регулярное выражение для поиска юредических заголовков 
-_KB_HEADINGS = [
-    (1, re.compile(r"^#\s+(.+)$")),
-    (2, re.compile(r"^#{2}\s+(.+)$")),
-    (3, re.compile(r"^#{3,6}\s+(.+)$")),
-    (1, re.compile(r"^(?:ЧАСТЬ|Часть)\s+[IVXLCDM\d]+.*$")),
-    (2, re.compile(r"^(?:ГЛАВА|Глава)\s+[IVXLCDM\d]+.*$")),
-    (3, re.compile(r"^(?:РАЗДЕЛ|Раздел)\s+[IVXLCDM\d]+.*$")),
-    (4, re.compile(r"^(?:Статья|Ст\.)\s*\d+(?:\.\d+)*\.?.*$")),
-    
+def norm_family(name: str) -> str:
+    text = name.lower().replace("ё", "е")
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = DATE_RE.sub(" ", text)
+    text = re.sub(r"редакци\w*|ред\.|от\s+\d", " ", text)
+    text = re.sub(r"[^a-zа-я ]+", " ", text)
+    return " ".join(sorted(set(w for w in text.split() if len(w) > 3)))
+
+#тут косяк был, исправил
+def make_doc(did: int, path_name: str, text: str) -> Doc:
+    name = re.sub(r"\s+", " ", Path(path_name).stem.replace("_", " ")).strip()
+    head = name + "\n" + text[:2500]
+    number = ""
+    m = NUM_RE.search(head)
+    if m:
+        number = m.group(1).replace("–", "-").strip()
+    parties: list[str] = []
+    for org in ORG_RE.findall(head):
+        org = org.strip()
+        if org and org not in parties:
+            parties.append(org)
+    edition, e_ord = "", 0
+    m = EDITION_RE.search(head) or DATE_RE.search(name) or DATE_RE.search(head)
+    if m:
+        edition = m.group(0) if m.re is EDITION_RE else m.group(0)
+        dm = DATE_RE.search(edition)
+        if dm:
+            e_ord = date_ord(dm.group(1), dm.group(2), dm.group(3))
+            edition = dm.group(0)
+    low = name.lower()
+    articles = len(re.findall(r"(?im)^\s*статья\s+\d+", text))
+    if articles >= 2 or "кодекс" in low or re.search(r"\bфз\b", low):
+        kind = "law"
+    elif "регламент" in low or "порядок" in low or "политик" in low:
+        kind = "regulation"
+    elif "договор" in low or "контракт" in low:
+        kind = "contract"
+    elif "записк" in low or "письм" in low:
+        kind = "memo"
+    else:
+        kind = "other"
+    return Doc(did=did, name=name, text=text, kind=kind, number=number,
+               parties=parties, edition=edition, edition_ord=e_ord, family=norm_family(name))
+
+
+def doc_label(doc: Doc) -> str:
+    parts = [doc.name]
+    if doc.number and doc.number not in doc.name:
+        parts.append(f"№ {doc.number}")
+    if doc.parties:
+        parts.append("(" + ", ".join(doc.parties[:3]) + ")")
+    if doc.edition:
+        parts.append(f"редакция от {doc.edition}")
+    return " ".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Структурная нарезка: заголовки -> статьи/разделы -> пункты
+# --------------------------------------------------------------------------- #
+HEAD_PATTERNS = [
+    (1, re.compile(r"^#{1,2}\s+(.{3,150})$")),
+    (1, re.compile(r"^(?:ЧАСТЬ|Часть)\s+[IVXLCDM\d]+")),
+    (2, re.compile(r"^(?:ГЛАВА|Глава|РАЗДЕЛ|Раздел)\s+[IVXLCDM\d]+")),
+    (2, re.compile(r"^\d{1,2}\.\s+[А-ЯA-ZЁ][^.]{3,120}$")),
+    (3, re.compile(r"^(?:Статья|СТАТЬЯ|ст\.)\s*\d+(?:\.\d+)*\.?.{0,120}$")),
+    (3, re.compile(r"^#{3,6}\s+(.{3,150})$")),
 ]
+CLAUSE_RE = re.compile(r"^(\d{1,2}(?:\.\d{1,3}){1,3})\.?\s+\S")
 
 
-def _kb_heading(line: str) -> tuple[int, str] | None:
-    """Если строка — юридический или структурный заголовок, возвращает (уровень, текст)."""
-    if not line or len(line) > 160:
+def match_heading(line: str):
+    if not line or len(line) > 170:
         return None
-    for level, pattern in _KB_HEADINGS:
-        m = pattern.match(line)
-        if m:
-            title = m.group(1) if m.groups() else line
-            return level, title.strip().rstrip("#").strip()[:120]
-    if 8 <= len(line) <= 90 and line == line.upper() and any(c.isalpha() for c in line) and not line.endswith("."):
-        return 2, line.strip()
+    for level, pattern in HEAD_PATTERNS:
+        if pattern.match(line):
+            return level, line.strip().rstrip("#").strip()[:130]
+    if (8 <= len(line) <= 90 and line == line.upper()
+            and any(c.isalpha() for c in line) and not line.endswith(".")):
+        return 1, line.strip()
     return None
 
 
-def _kb_sections(text: str) -> list[tuple[str, str]]:
-    """Разбивает документ на логические секции со стеком заголовков (Глава > Раздел > Статья)."""
-    sections: list[tuple[str, str]] = []
+def split_units(doc: Doc) -> list[tuple[str, str, str]]:
+    units: list[tuple[str, str, str]] = []
     stack: list[tuple[int, str]] = []
+    clause = ""
     buf: list[str] = []
 
     def flush() -> None:
         body = "\n".join(buf).strip()
         if body:
-            sections.append((" > ".join(t for _, t in stack), body))
+            units.append((" > ".join(t for _, t in stack), clause, body))
 
-    for line in text.splitlines():
-        clean_line = line.strip()
-        h = _kb_heading(clean_line)
-        if h:
+    for raw_line in doc.text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        head = match_heading(line)
+        if head:
             flush()
-            buf = [clean_line]
-            level, title = h
+            level, title = head
             while stack and stack[-1][0] >= level:
                 stack.pop()
             stack.append((level, title))
-        else:
-            buf.append(line)
-    flush()
-    return sections
-
-
-def build_chunks(
-    documents: list[tuple[str, str]],
-    parent_size: int = 1000,
-    parent_overlap: int = 150,
-    child_size: int = 250,
-    child_overlap: int = 40,
-) -> tuple[list[ParentChunk], list[ChildChunk]]:
-    """Строит Parent-Document чанки с иерархическими хлебными крошками."""
-    parent_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=parent_size,
-        chunk_overlap=parent_overlap,
-        length_function=count_tockens,
-        separators=["\n\n", "\n", ". ", "; ", " ", ""],
-    )
-    child_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=child_size,
-        chunk_overlap=child_overlap,
-        length_function=count_tockens,
-        separators=["\n\n", "\n", ". ", "; ", " ", ""],
-    )
-
-    parents: list[ParentChunk] = []
-    children: list[ChildChunk] = []
-
-    for doc_name, full_text in documents:
-        clean_doc_name = str(Path(doc_name).with_suffix("")).replace("_", " ").strip()
-        sections = _kb_sections(full_text) or [("", full_text)]
-
-        for crumb, section_body in sections:
-            full_header = f"{clean_doc_name} > {crumb}" if crumb else clean_doc_name
-            parent_texts = (
-                [section_body]
-                if CHUNKER.strip().lower() in ("off", "none", "disabled")
-                else parent_splitter.split_text(section_body)
-            )
-
-            for p_text in parent_texts:
-                p_text = p_text.strip()
-                if not p_text:
-                    continue
-
-                parent_id = len(parents)
-                enriched_parent = f"[Документ: {clean_doc_name} | Раздел: {full_header}]\n{p_text}"
-                parents.append(
-                    ParentChunk(
-                        parent_id=parent_id,
-                        doc_name=clean_doc_name,
-                        header=full_header,
-                        text=enriched_parent,
-                    )
-                )
-
-                child_texts = child_splitter.split_text(p_text)
-                for c_text in child_texts:
-                    c_text = c_text.strip()
-                    if not c_text:
-                        continue
-                    enriched_child = f"{full_header}\n{c_text}"
-                    children.append(
-                        ChildChunk(
-                            child_id=len(children),
-                            parent_id=parent_id,
-                            doc_name=clean_doc_name,
-                            header=full_header,
-                            text=enriched_child,
-                        )
-                    )
-
-    return parents, children
-
-
-TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+(?:[\.\-][0-9A-Za-zА-Яа-яЁё]+)*")
-
-def tokenize_ru(text: str) -> list[str]:
-    """Токенизация для BM25 с сохранением номеров статей/пунктов и базовой нормализацией."""
-    raw_tokens = TOKEN_RE.findall(text.lower().replace("ё", "е"))
-    tokens = []
-    for tok in raw_tokens:
-        if len(tok) <= 1:
+            clause = ""
+            buf = [line]
             continue
-        # Для длинных русских слов отсекаем 2 последних символа 
-        if len(tok) >= 6 and tok.isalpha():
-            tokens.append(tok[:-2])
+        m = CLAUSE_RE.match(line)
+        if m:
+            flush()
+            clause = m.group(1)
+            buf = [line]
+            continue
+        buf.append(line)
+    flush()
+    return units or [("", "", doc.text)]
+
+
+def split_text(text: str, size: int, overlap: int) -> list[str]:
+    if len(text) <= size:
+        return [text]
+    sentences = re.split(r"(?<=[.;!?])\s+", text)
+    chunks: list[str] = []
+    cur = ""
+    for sent in sentences:
+        if len(sent) > size:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            step = max(1, size - overlap)
+            for i in range(0, len(sent), step):
+                chunks.append(sent[i:i + size])
+            continue
+        if len(cur) + len(sent) + 1 <= size:
+            cur = (cur + " " + sent).strip()
         else:
-            tokens.append(tok)
-    return tokens        
+            if cur:
+                chunks.append(cur)
+            tail = chunks[-1][-overlap:] if (chunks and overlap) else ""
+            cur = (tail + " " + sent).strip()
+    if cur:
+        chunks.append(cur)
+    return [c for c in chunks if c.strip()]
+
 
 @dataclass
-class HybridIndex:
-    parents: list[ParentChunk]
-    children: list[ChildChunk]
-    bm25: bm25s.BM25
-    faiss_index: faiss.IndexFlatIP | None
+class Block:
+    bid: int
+    did: int
+    crumb: str
+    text: str
+    clauses: list[str] = field(default_factory=list)
 
 
-def post_with_retry(
-    client: httpx.Client,
-    path: str,
-    key: str,
-    payload: dict,
-    retries: int = 4,
-) -> dict:
-    """Универсальный POST-запрос с экспоненциальной паузой при 429 / 5xx."""
-    if not key:
-        raise ValueError("На платформе отсутствует API-ключ")
-    last_exc: Exception | None = None
-    for attempt in range(retries):
-        try:
-            response = client.post(
-                API_BASE + path,
-                headers={"Authorization": "Bearer " + key},
-                json=payload,
-            )
-            if response.status_code in {429, 500, 502, 503, 504}:
-                raise httpx.HTTPStatusError(
-                    f"HTTP {response.status_code}",
-                    request=response.request,
-                    response=response,
-                )
-            response.raise_for_status()
-            return response.json()
-        except Exception as exc:
-            last_exc = exc
-            if attempt < retries - 1:
-                time.sleep(1.5 * (2 ** attempt))
-    raise last_exc or RuntimeError("Неизвестная ошибка сети")
+@dataclass
+class Child:
+    cid: int
+    bid: int
+    did: int
+    text: str
 
 
-def fetch_embeddings_batch(client: httpx.Client, texts: list[str]) -> np.ndarray:
-    """Получает нормализованные L2-векторы для батча текстов."""
-    result = post_with_retry(
-        client,
-        "/embeddings",
-        EMBED_KEY,
-        {
-            "model": EMB_MODEL,
-            "input": texts,
-            "encoding_format": "float",
-        },
-    )
-    vectors: list[list[float] | None] = [None] * len(texts)
-    for pos, item in enumerate(result["data"]):
-        idx = int(item.get("index", pos))
-        if 0 <= idx < len(texts):
-            vectors[idx] = item["embedding"]
-    if any(v is None for v in vectors):
-        raise ValueError("Получены не все embeddings от прокси")
-
-    arr = np.array(vectors, dtype=np.float32)
-    faiss.normalize_L2(arr)
-    return arr
-
-
-def build_hybrid_index(
-    parents: list[ParentChunk],
-    children: list[ChildChunk],
-    batch_size: int = 32,
-) -> HybridIndex:
-    """Строит лексический (BM25s) и векторный (FAISS) индексы по дочерним чанкам."""
-    # 1. Лексический индекс BM25s (работает локально за миллисекунды)
-    corpus_tokens = [tokenize_ru(c.text) for c in children]
-    retriever = bm25s.BM25()
-    retriever.index(corpus_tokens, show_progress=False)
-
-    # 2. Векторный индекс FAISS через локальный прокси BAAI/bge-m3
-    faiss_index: faiss.IndexFlatIP | None = None
-    try:
-        all_vectors = []
-        with httpx.Client(timeout=120.0) as client:
-            for start in range(0, len(children), batch_size):
-                batch_texts = [c.text for c in children[start : start + batch_size]]
-                batch_vecs = fetch_embeddings_batch(client, batch_texts)
-                all_vectors.append(batch_vecs)
-
-        if all_vectors:
-            matrix = np.vstack(all_vectors)
-            faiss_index = faiss.IndexFlatIP(matrix.shape[1])
-            faiss_index.add(matrix)
-            print(f"FAISS индекс построен: {faiss_index.ntotal} векторов (dim={matrix.shape[1]})", flush=True)
-    except Exception as exc:
-        print(
-            f"Предупреждение: не удалось построить FAISS ({type(exc).__name__}), работаем только на BM25s",
-            file=sys.stderr,
-            flush=True,
-        )
-        faiss_index = None
-
-    return HybridIndex(
-        parents=parents,
-        children=children,
-        bm25=retriever,
-        faiss_index=faiss_index,
-    )
+def build_blocks(docs: list[Doc]):
+    blocks: list[Block] = []
+    children: list[Child] = []
+    for doc in docs:
+        label = doc_label(doc)
+        units = split_units(doc)
+        groups: list[list] = []
+        for crumb, clause, body in units:
+            if groups and groups[-1][0] == crumb and groups[-1][2] + len(body) <= BLOCK_MAX:
+                groups[-1][1].append((clause, body))
+                groups[-1][2] += len(body)
+            else:
+                groups.append([crumb, [(clause, body)], len(body)])
+        outline_parts: list[str] = []
+        for crumb, group_units, _ in groups:
+            header = label + (f" | {crumb}" if crumb else "")
+            body = "\n".join(text for _, text in group_units)
+            block = Block(bid=len(blocks), did=doc.did, crumb=crumb,
+                          text=f"[{header}]\n{body}",
+                          clauses=[c for c, _ in group_units if c])
+            blocks.append(block)
+            if crumb:
+                outline_parts.append(crumb.split(" > ")[-1])
+            for clause, unit_text in group_units:
+                for piece in split_text(unit_text, CHILD_MAX, CHILD_OVL):
+                    children.append(Child(cid=len(children), bid=block.bid, did=doc.did,
+                                          text=f"{header}\n{piece}"))
+        doc.outline = build_outline(doc, units, outline_parts)
+    return blocks, children
 
 
-DIALOGUE_MARKERS_RE = re.compile(
-    r"(?:^|\n)\s*(?:user|assistant|пользователь|ассистент|вопрос|ответ)\s*:",
-    re.IGNORECASE,
+def build_outline(doc: Doc, units, sections: list[str]) -> str:
+    articles: list[str] = []
+    for crumb, _, body in units:
+        for m in re.finditer(r"(?:Статья|ст\.)\s*(\d+(?:\.\d+)?)", crumb + "\n" + body[:120]):
+            if m.group(1) not in articles:
+                articles.append(m.group(1))
+    clauses: list[str] = []
+    for _, clause, _ in units:
+        if clause and clause not in clauses:
+            clauses.append(clause)
+    bits: list[str] = []
+    if articles:
+        bits.append("статьи: " + ", ".join(sorted(articles, key=lambda s: float(s))[:40]))
+    uniq_sections: list[str] = []
+    for sec in sections:
+        short = sec[:70]
+        if short not in uniq_sections:
+            uniq_sections.append(short)
+    if uniq_sections and not articles:
+        bits.append("разделы: " + "; ".join(uniq_sections[:10]))
+    if clauses:
+        bits.append("пункты: " + ", ".join(clauses[:45]))
+    return "; ".join(bits)[:400]
+
+
+def build_catalog(docs: list[Doc]) -> str:
+    lines = []
+    for doc in docs:
+        line = f"- {doc_label(doc)}"
+        if doc.outline:
+            line += f" [{doc.outline}]"
+        lines.append(line[:420])
+    text = "\n".join(lines)
+    return text[:3000]
+
+
+# --------------------------------------------------------------------------- #
+# Лексический индекс: BM25 на numpy + аккуратная русская нормализация
+# --------------------------------------------------------------------------- #
+WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+(?:[.\-/][0-9A-Za-zА-Яа-яЁё]+)*")
+SUFFIXES = (
+    "иями", "ями", "ами", "ого", "его", "ому", "ему", "ыми", "ими", "ее", "ие",
+    "ые", "ой", "ей", "ем", "ам", "ах", "ях", "ов", "ев", "ий", "ый", "ая", "яя",
+    "ое", "ых", "их", "ют", "ят", "ат", "ет", "ит", "ла", "ло", "ли", "ть", "у",
+    "ю", "а", "я", "ы", "и", "е", "о", "ь", "й",
 )
 
 
-def rewrite_dialogue_query(client: httpx.Client, question: str) -> str:
-    """Если вопрос содержит историю диалога, переформулирует последний запрос в самодостаточный."""
-    # Одиночный короткий вопрос без маркеров диалога не требует лишнего вызова LLM
-    if "\n" not in question and not DIALOGUE_MARKERS_RE.search(question):
-        return question
+def stem(word: str) -> str:
+    if len(word) <= 4 or not word.isalpha():
+        return word
+    for suf in SUFFIXES:
+        if word.endswith(suf) and len(word) - len(suf) >= 4:
+            return word[:-len(suf)]
+    return word
 
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Ты — модуль подготовки поисковых запросов для юридической базы знаний. "
-                    "Тебе передана история диалога и последняя реплика пользователя. "
-                    "Перепиши последнюю реплику в один четкий, самодостаточный поисковый запрос, "
-                    "раскрыв все местоимения и контекст из предыдущих сообщений. "
-                    "Не отвечай на вопрос и не добавляй ничего от себя — верни только текст запроса."
-                ),
-            },
-            {"role": "user", "content": question},
-        ],
-        "temperature": 0.0,
-        "max_tokens": 200,
-    }
+
+def tokenize(text: str) -> list[str]:
+    out: list[str] = []
+    for raw in WORD_RE.findall(text.lower().replace("ё", "е")):
+        if len(raw) < 2:
+            continue
+        out.append(stem(raw))
+        if re.search(r"[.\-/]", raw):
+            for part in re.split(r"[.\-/]", raw):
+                if len(part) >= 2:
+                    out.append(stem(part))
+    return out
+
+
+class BM25:
+    def __init__(self, corpus: list[list[str]], k1: float = 1.5, b: float = 0.75):
+        self.k1, self.b = k1, b
+        self.n = len(corpus)
+        self.dl = np.asarray([len(t) for t in corpus], dtype=np.float32)
+        self.avgdl = float(self.dl.mean()) if self.n else 1.0
+        counts: dict[str, dict[int, int]] = {}
+        for did, tokens in enumerate(corpus):
+            for tok in tokens:
+                bucket = counts.get(tok)
+                if bucket is None:
+                    bucket = counts[tok] = {}
+                bucket[did] = bucket.get(did, 0) + 1
+        self.postings: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self.idf: dict[str, float] = {}
+        for tok, bucket in counts.items():
+            df = len(bucket)
+            self.idf[tok] = float(np.log(1.0 + (self.n - df + 0.5) / (df + 0.5)))
+            self.postings[tok] = (
+                np.asarray(list(bucket.keys()), dtype=np.int32),
+                np.asarray(list(bucket.values()), dtype=np.float32),
+            )
+
+    def search(self, query_tokens: list[str], k: int) -> list[tuple[int, float]]:
+        if not self.n or not query_tokens:
+            return []
+        scores = np.zeros(self.n, dtype=np.float32)
+        norm = self.k1 * (1.0 - self.b + self.b * self.dl / max(self.avgdl, 1e-6))
+        for tok in set(query_tokens):
+            posting = self.postings.get(tok)
+            if posting is None:
+                continue
+            ids, tf = posting
+            scores[ids] += self.idf[tok] * (tf * (self.k1 + 1.0)) / (tf + norm[ids])
+        k = max(1, min(k, self.n))
+        top = np.argsort(-scores)[:k]
+        return [(int(i), float(scores[i])) for i in top if scores[i] > 0.0]
+
+
+# --------------------------------------------------------------------------- #
+# Разбор вопроса: диалог, дата события, контрагент, номер договора
+# --------------------------------------------------------------------------- #
+ROLE_RE = re.compile(r"(?:^|\n)\s*(пользователь|ассистент|user|assistant)\s*:", re.I)
+MONTHS = {"январ": 1, "феврал": 2, "март": 3, "апрел": 4, "май": 5, "мая": 5, "июн": 6,
+          "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12}
+
+
+@dataclass
+class QueryInfo:
+    raw: str
+    last_turn: str
+    is_dialogue: bool
+    search: str = ""
+    event_ord: int = 0
+    event_text: str = ""
+    doc_hits: set = field(default_factory=set)
+    number_hits: set = field(default_factory=set)
+    ambiguous: bool = False
+
+
+def last_user_turn(question: str) -> tuple[str, bool]:
+    matches = list(ROLE_RE.finditer(question))
+    if not matches:
+        return question.strip(), False
+    last = question.strip()
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(question)
+        if m.group(1).lower() in {"пользователь", "user"}:
+            last = question[m.end():end].strip()
+    return last, True
+
+
+def find_event_date(text: str) -> tuple[int, str]:
+    m = DATE_RE.search(text)
+    if m:
+        return date_ord(m.group(1), m.group(2), m.group(3)), m.group(0)
+    for m in re.finditer(r"([А-Яа-яЁё]{3,10})\s+(20\d{2})", text):
+        word = m.group(1).lower().replace("ё", "е")
+        for key, month in MONTHS.items():
+            if word.startswith(key):
+                return int(m.group(2)) * 10000 + month * 100 + 1, m.group(0)
+    m = re.search(r"\b(20\d{2})\s*год", text)
+    if m:
+        return int(m.group(1)) * 10000 + 701, m.group(0)
+    return 0, ""
+
+
+def detect_entities(query: str, docs: list[Doc], own_orgs: set) -> tuple[set, set, bool]:
+    q = query.lower().replace("ё", "е")
+    q_norm = re.sub(r"[–—]", "-", query)
+    q_tokens = set(re.findall(r"[a-zа-я0-9]+", q))
+    number_hits: set = set()
+    name_hits: set = set()
+    for doc in docs:
+        if doc.number and re.search(re.escape(doc.number), q_norm, re.I):
+            number_hits.add(doc.did)
+        for party in doc.parties:
+            if party in own_orgs:
+                continue
+            pname = party.lower().replace("ё", "е")
+            if re.search(r"(?<![а-яa-z0-9])" + re.escape(pname) + r"(?![а-яa-z0-9])", q):
+                name_hits.add(doc.did)
+    if number_hits or name_hits:
+        return number_hits, name_hits, len(name_hits) > 1
+    exact: set = set()
+    prefix: set = set()
+    for doc in docs:
+        for party in doc.parties:
+            if party in own_orgs:
+                continue
+            ptoks = [t for t in re.findall(r"[a-zа-я0-9]+", party.lower().replace("ё", "е"))
+                     if len(t) >= 4]
+            if not ptoks:
+                continue
+            if any(t in q_tokens for t in ptoks):
+                exact.add(doc.did)
+            if all(any(qt.startswith(t[:max(4, len(t) - 2)]) for qt in q_tokens) for t in ptoks):
+                prefix.add(doc.did)
+    hits = exact or prefix
+    return number_hits, hits, len(hits) > 1
+
+
+def analyze(question: str, docs: list[Doc], own_orgs: set) -> QueryInfo:
+    last, is_dialogue = last_user_turn(question)
+    event_ord, event_text = find_event_date(question)
+    numbers, names, ambiguous = detect_entities(question, docs, own_orgs)
+    return QueryInfo(raw=question, last_turn=last, is_dialogue=is_dialogue, search=last,
+                     event_ord=event_ord, event_text=event_text,
+                     doc_hits=set(numbers) | set(names), number_hits=set(numbers),
+                     ambiguous=ambiguous)
+
+
+REWRITE_SYSTEM = (
+    "Ты — модуль подготовки поисковых запросов к юридической базе знаний. "
+    "Тебе дан вопрос сотрудника, возможно с историей диалога. Собери ОДИН самодостаточный "
+    "поисковый запрос по последней реплике пользователя: раскрой местоимения, подставь "
+    "название контрагента, номер договора и предмет из истории. Добавь 2-4 юридических "
+    "термина-синонима, которые встречаются в договорах и законах по этой теме. "
+    "Ничего не выдумывай, не отвечай на вопрос. Верни только текст запроса одной строкой."
+)
+
+
+def rewrite(info: QueryInfo, deadline: float) -> str:
+    need = info.is_dialogue or len(info.last_turn.split()) < 7 or re.search(
+        r"\b(это|так|там|они|него|неё|них|такой|этот|эта)\b", info.last_turn.lower())
+    if not need:
+        return info.last_turn
     try:
-        result = post_with_retry(client, "/chat/completions", LLM_KEY, payload, retries=2)
-        rewritten = result["choices"][0]["message"].get("content", "").strip()
-        if rewritten and len(rewritten) <= 1000:
-            return rewritten
-    except Exception as exc:
-        print(f"Query rewrite пропущен ({type(exc).__name__}), используем исходный вопрос", file=sys.stderr)
-    return question
+        text = chat(
+            [{"role": "system", "content": REWRITE_SYSTEM},
+             {"role": "user", "content": info.raw}],
+            max_tokens=180, retries=2, timeout=60.0, deadline=deadline,
+        )
+    except Exception:
+        return info.last_turn
+    text = text.strip().strip('"').split("\n")[0].strip()
+    if 8 <= len(text) <= 400:
+        return text
+    return info.last_turn
 
 
-def rerank_parents(
-    client: httpx.Client,
-    search_query: str,
-    candidates: list[ParentChunk],
-) -> list[ParentChunk]:
-    """Переранжирует родительские чанки с помощью Qwen3 Reranker 8B."""
-    if len(candidates) <= 1:
-        return candidates
-
-    top_n = min(RERANKER_TOP_N, len(candidates))
-    result = post_with_retry(
-        client,
-        "/rerank",
-        RERANK_KEY,
-        {
-            "model": RERANKER_MODEL,
-            "query": search_query,
-            "documents": [p.text for p in candidates],
-            "top_n": top_n,
-        },
-        retries=3,
-    )
-    items = result.get("results", result.get("data", []))
-    ranked: list[ParentChunk] = []
-    seen = set()
-    for item in items:
-        idx = int(item["index"])
-        if 0 <= idx < len(candidates) and idx not in seen:
-            seen.add(idx)
-            ranked.append(candidates[idx])
-    return ranked[:top_n] if ranked else candidates[:top_n]
+def edition_plan(docs: list[Doc], event_ord: int) -> dict:
+    families: dict = {}
+    for doc in docs:
+        # редакции бывают у регламентов/законов, но не у разных договоров
+        if doc.edition_ord and doc.kind != "contract":
+            families.setdefault((doc.family, doc.number), []).append(doc)
+    plan: dict = {}
+    for group in families.values():
+        if len(group) < 2:
+            continue
+        group = sorted(group, key=lambda d: d.edition_ord)
+        applicable = group[-1]
+        if event_ord:
+            applicable = group[0]
+            for doc in group:
+                if doc.edition_ord <= event_ord:
+                    applicable = doc
+        for doc in group:
+            plan[doc.did] = {
+                "applicable": doc.did == applicable.did,
+                "applicable_edition": applicable.edition,
+                "current_edition": group[-1].edition,
+                "editions": [d.edition for d in group],
+            }
+    return plan
 
 
-def retrieve_context(
-    client: httpx.Client,
-    question: str,
-    index: HybridIndex,
-    rrf_k: int = 60,
-) -> list[ParentChunk]:
-    """Выполняет гибридный поиск (BM25s + FAISS), RRF-слияние и реранкинг."""
-    if not index.children:
+# --------------------------------------------------------------------------- #
+# Поиск
+# --------------------------------------------------------------------------- #
+@dataclass
+class SearchEngine:
+    docs: list[Doc]
+    blocks: list[Block]
+    children: list[Child]
+    bm25: BM25
+    vec: VecIndex
+    catalog: str
+    own_orgs: set
+
+
+def build_engine(docs: list[Doc]) -> SearchEngine:
+    blocks, children = build_blocks(docs)
+    log(f"чанки: {len(blocks)} блоков / {len(children)} поисковых фрагментов")
+    bm25 = BM25([tokenize(c.text) for c in children])
+    vec = VecIndex([], None)
+    if USE_EMBED and children and API_BASE and API_KEY:
+        subset = children[:MAX_EMBED_CHILDREN]
+        deadline = min(T0 + INDEX_BUDGET, DEADLINE - 120)
+        ids, matrix = embed_many([c.text for c in subset], deadline)
+        if matrix is not None:
+            vec = VecIndex(ids, matrix)
+            log(f"векторный индекс: {len(vec)} фрагментов (dim={matrix.shape[1]})")
+        else:
+            warn("эмбеддинги недоступны — работаем на BM25")
+    org_counts: dict[str, int] = {}
+    for doc in docs:
+        for party in doc.parties:
+            org_counts[party] = org_counts.get(party, 0) + 1
+    own = {p for p, n in org_counts.items() if n > max(1, len(docs) // 2)}
+    return SearchEngine(docs=docs, blocks=blocks, children=children, bm25=bm25, vec=vec,
+                        catalog=build_catalog(docs), own_orgs=own)
+
+
+def doc_multiplier(doc: Doc, info: QueryInfo, plan: dict, docs: list[Doc]) -> float:
+    mult = 1.0
+    if info.doc_hits:
+        if doc.did in info.number_hits:
+            mult *= 3.0
+        elif doc.did in info.doc_hits:
+            mult *= 2.2
+        else:
+            mult *= 0.9
+            hit_parties = [p.lower() for d in info.doc_hits for p in docs[d].parties]
+            for party in doc.parties:
+                if any(party.lower() != o and party.lower()[:5] == o[:5] for o in hit_parties):
+                    mult *= 0.3
+                    break
+    entry = plan.get(doc.did)
+    if entry:
+        mult *= 1.8 if entry["applicable"] else 0.55
+    return mult
+
+
+def retrieve(engine: SearchEngine, info: QueryInfo, deadline: float) -> list[Block]:
+    if not engine.children:
+        return []
+    plan = edition_plan(engine.docs, info.event_ord)
+    
+    variants = [info.search]
+    if info.last_turn and info.last_turn != info.search:
+        variants.append(info.last_turn)
+    cues = " ".join(sorted({engine.docs[d].number for d in info.number_hits if engine.docs[d].number}))
+    if cues:
+        variants.append(f"{info.search} {cues}")
+    variants = variants[:3]
+
+    q_tokens = [tokenize(v) for v in variants]
+    q_vecs: list = []
+    if len(engine.vec):
+        try:
+            arr = _embed_call(variants, min(deadline, time.time() + 45))
+            q_vecs = [arr[i] for i in range(len(variants))]
+        except Exception as exc:
+            warn(f"вектор запроса недоступен ({type(exc).__name__})")
+
+    rrf: dict[int, float] = {}
+    k = min(TOP_K, len(engine.children))
+    for vi, tokens in enumerate(q_tokens):
+        weight = 1.0 if vi == 0 else 0.6
+        for rank, (cid, _) in enumerate(engine.bm25.search(tokens, k)):
+            rrf[cid] = rrf.get(cid, 0.0) + weight / (60.0 + rank + 1)
+        if vi < len(q_vecs):
+            for rank, (cid, _) in enumerate(engine.vec.search(q_vecs[vi], k)):
+                rrf[cid] = rrf.get(cid, 0.0) + weight / (60.0 + rank + 1)
+    if not rrf:
         return []
 
-    search_query = rewrite_dialogue_query(client, question)
-    k = min(RETRIEVAL_TOP_K, len(index.children))
-    rrf_scores: dict[int, float] = {}
-
-    # 1. Лексический поиск BM25s
-    q_tokens = tokenize_ru(search_query)
-    if q_tokens:
-        bm25_indices, _ = index.bm25.retrieve([q_tokens], k=k, show_progress=False)
-        for rank, child_idx in enumerate(bm25_indices[0]):
-            cid = int(child_idx)
-            if 0 <= cid < len(index.children):
-                rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (rrf_k + rank + 1)
-
-    # 2. Векторный поиск FAISS (BAAI/bge-m3)
-    if index.faiss_index is not None:
-        try:
-            q_vec = fetch_embeddings_batch(client, [search_query])
-            _, faiss_indices = index.faiss_index.search(q_vec, k)
-            for rank, child_idx in enumerate(faiss_indices[0]):
-                cid = int(child_idx)
-                if 0 <= cid < len(index.children):
-                    rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (rrf_k + rank + 1)
-        except Exception as exc:
-            print(f"Ошибка векторного поиска ({type(exc).__name__}), используем BM25", file=sys.stderr)
-
-    # Если оба поиска ничего не вернули, берем первые чанки как страховку
-    if not rrf_scores:
-        sorted_child_ids = list(range(min(k, len(index.children))))
+    agg: dict[int, float] = {}
+    for cid, score in rrf.items():
+        bid = engine.children[cid].bid
+        agg[bid] = agg.get(bid, 0.0) + score
+    best: dict[int, float] = {}
+    for cid, score in rrf.items():
+        bid = engine.children[cid].bid
+        best[bid] = max(best.get(bid, 0.0), score)
+    scored = {bid: best[bid] + 0.25 * (total - best[bid]) for bid, total in agg.items()}
+    for bid in scored:
+        scored[bid] *= doc_multiplier(engine.docs[engine.blocks[bid].did], info, plan, engine.docs)
+    ranked = sorted(scored, key=lambda b: scored[b], reverse=True)
+    if len(engine.blocks) <= 12:
+        pool = [engine.blocks[b] for b in sorted(ranked)]
     else:
-        sorted_child_ids = sorted(rrf_scores.keys(), key=lambda cid: rrf_scores[cid], reverse=True)
+        pool = [engine.blocks[b] for b in ranked[:max(24, RERANK_TOP_N * 3)]]
 
-    # 3. Агрегация оценок дочерних чанков на уровень родительских документов (Parent-Document)
-    parent_scores: dict[int, float] = {}
-    for cid in sorted_child_ids:
-        pid = index.children[cid].parent_id
-        # Суммируем RRF-вес дочерних чанков внутри одного родителя
-        parent_scores[pid] = parent_scores.get(pid, 0.0) + rrf_scores.get(cid, 0.0)
+    selected: list[Block] = pool[:RERANK_TOP_N]
+    if USE_RERANK and len(pool) > 1 and left() > 60:
+        query = info.search + (" " + cues if cues else "")
+        try:
+            order = rerank(query, [b.text for b in pool], min(RERANK_TOP_N, len(pool)), deadline)
+            if order:
+                selected = [pool[i] for i in order]
+        except Exception as exc:
+            warn(f"реранк недоступен ({type(exc).__name__})")
 
-    # Берем топ-18 лучших уникальных родительских блоков для отправки в реранкер
-    rerank_pool_size = max(RERANKER_TOP_N * 3, 15)
-    top_parent_ids = sorted(parent_scores.keys(), key=lambda pid: parent_scores[pid], reverse=True)[:rerank_pool_size]
-    candidate_parents = [index.parents[pid] for pid in top_parent_ids]
-
-    # 4. Финальный реранкинг через Qwen3 Reranker 8B
-    try:
-        return rerank_parents(client, search_query, candidate_parents)
-    except Exception as exc:
-        print(f"Reranker недоступен ({type(exc).__name__}), возвращаем RRF-топ", file=sys.stderr)
-        return candidate_parents[:RERANKER_TOP_N]
-
-
-SYSTEM_PROMPT = (
-    "Ты — юридический ассистент компании. Дай точный, краткий и фактологически безупречный ответ "
-    "на вопрос пользователя ИСКЛЮЧИТЕЛЬНО на основе предоставленных ниже фрагментов документов.\n\n"
-    "Строгие правила:\n"
-    "1. Запрещено использовать внешние знания, законы или статьи, которых нет в переданных фрагментах. "
-    "Любой выдуманный факт или домысел недопустимы.\n"
-    "2. Если информации для ответа в фрагментах нет — прямо напиши, что в базе знаний нет документов по этому вопросу, "
-    "и откажись отвечать по памяти. Если в фрагментах есть только часть норм (например, упомянуты другие статьи, "
-    "которых нет в тексте), укажи только то, что есть в базе, и отметь, каких статей/документов не хватает.\n"
-    "3. Если пользователь в вопросе называет неверную цифру, срок или условие — прямо опровергни это со ссылкой на документ.\n"
-    "4. Обращай внимание на даты и редакции документов: если вопрос касается события в прошлом, применяй редакцию регламента "
-    "или договора, действовавшую на ту дату.\n"
-    "5. Формат ответа: один связный абзац (40–80 слов, без списков и лишних вступлений). Если вопрос предполагает «да/нет», "
-    "начни ответ со слова «Да.» или «Нет.». Обязательно укажи точный источник и пункт/статью.\n\n"
-    "Примеры эталонного стиля ответа:\n"
-    "— Арендная плата по договору аренды № А-08/2024 с ООО «Северный Склад» — 450 000 рублей в месяц, включая НДС (п. 3.1). "
-    "Вносится ежемесячно, не позднее 5-го числа текущего месяца (п. 3.2).\n"
-    "— Да. Во время испытания на работника распространяются положения трудового законодательства, коллективного договора, "
-    "соглашений и локальных нормативных актов работодателя. Источник: ТК РФ, ст. 70."
-)
+    chosen = {b.bid for b in selected}
+    # гарантированно добавляем нужный договор / применимую и действующую редакции
+    for bid in ranked[:40]:
+        block = engine.blocks[bid]
+        if block.bid in chosen:
+            continue
+        need = block.did in info.number_hits
+        entry = plan.get(block.did)
+        if entry and any(engine.blocks[s.bid].did in plan for s in selected):
+            fam = engine.docs[block.did].family
+            if any(engine.docs[s.did].family == fam for s in selected):
+                need = True
+        if need:
+            selected.append(block)
+            chosen.add(block.bid)
+        if len(selected) >= RERANK_TOP_N + 4:
+            break
+    return selected
 
 
+def assemble_context(engine: SearchEngine, selected: list[Block]) -> str:
+    if not selected:
+        return ""
+    ordered = sorted(selected, key=lambda b: (b.did, b.bid))
+    parts: list[str] = []
+    used = 0
+    for block in ordered:
+        text = block.text
+        if used + len(text) > CTX_CHARS:
+            room = CTX_CHARS - used
+            if room < 400:
+                break
+            text = text[:room]
+        parts.append(text)
+        used += len(text)
+    # соседние блоки того же раздела — чтобы не потерять «п. 6.2» рядом с «п. 6.1»
+    if used < CTX_CHARS * 0.75:
+        have = {b.bid for b in ordered}
+        extra: list[Block] = []
+        for block in ordered:
+            for delta in (-1, 1):
+                nb = block.bid + delta
+                if 0 <= nb < len(engine.blocks) and nb not in have:
+                    cand = engine.blocks[nb]
+                    if cand.did == block.did and cand.crumb.split(" > ")[0] == block.crumb.split(" > ")[0]:
+                        extra.append(cand)
+                        have.add(nb)
+        for block in sorted(extra, key=lambda b: (b.did, b.bid)):
+            if used + len(block.text) > CTX_CHARS:
+                break
+            parts.append(block.text)
+            used += len(block.text)
+        merged = sorted(ordered + extra, key=lambda b: (b.did, b.bid))
+        parts, used = [], 0
+        for block in merged:
+            if used + len(block.text) > CTX_CHARS:
+                break
+            parts.append(block.text)
+            used += len(block.text)
+    return "\n\n".join(parts)
 
-def generate_answer(client: httpx.Client, question: str, chunks: list[ParentChunk]) -> str:
-    """Генерирует юридически обоснованный ответ строго по отобранным родительским фрагментам."""
-    if not chunks:
+
+# --------------------------------------------------------------------------- #
+# Генерация и контроль достоверности
+# --------------------------------------------------------------------------- #
+SYSTEM_PROMPT = """Ты — юридический ассистент компании. Отвечаешь сотруднику строго по документам из базы знаний, приведённым в сообщении пользователя.
+
+ПРАВИЛА ДОСТОВЕРНОСТИ:
+1. Используй только текст приведённых документов. Никаких внешних знаний, «общих норм права» и предположений. Каждая сумма, срок, номер пункта, статья, дата и название должны буквально следовать из текста документов.
+2. Никогда не выдумывай номера пунктов/статей и не приписывай документу условия, которых в нём нет. Выдуманный факт недопустим.
+3. Если в вопросе неверная предпосылка (другая сумма, срок, условие) — прямо исправь её и приведи верное значение со ссылкой на пункт.
+4. Учитывай редакции и даты: для события в прошлом применяй редакцию, действовавшую на дату события; при необходимости кратко отметь, что действующая редакция иная и к тому событию не применяется.
+5. Не путай похожие названия контрагентов (например, «Альфа-Трейд» и «Альфа-Трейдинг» — разные компании) и разные договоры. Отвечай по тому документу, о котором спрашивает пользователь.
+6. Если нужных документов в базе нет — прямо скажи, что в базе знаний нет документов по этому вопросу, по памяти отвечать нельзя, и направь к юристу или в отдел кадров. Не подменяй ответ общими рассуждениями.
+7. Если данные есть частично — ответь по имеющемуся тексту и прямо укажи, каких статей или документов в базе не хватает (сверяйся с каталогом базы знаний). Не делай вид, что отсутствующие нормы тебе известны.
+8. Если в диалоге уточнение уже дано — отвечай по уточнению, повторно ничего не спрашивай.
+
+ФОРМАТ ОТВЕТА:
+- Один связный абзац, 40–90 слов, без списков, заголовков и markdown.
+- На вопрос «да/нет» отвечай первым словом «Да.» или «Нет.», затем обоснование.
+- Всегда указывай источник: название/номер документа и пункт (п. 3.1) либо статью (ТК РФ, ст. 70).
+- Деловой тон, без вступлений «согласно предоставленным фрагментам», без пересказа вопроса."""
+
+VERIFY_SYSTEM = """Ты — контролёр достоверности юридических ответов. Тебе даны выдержки документов, вопрос сотрудника и черновик ответа.
+Проверь по документам: (1) каждую сумму, срок, номер пункта/статьи, название контрагента, номер договора и дату редакции; (2) не перепутаны ли похожие контрагенты или договоры; (3) применена ли редакция, действовавшая на дату события; (4) нет ли выдуманных фактов; (5) нет ли ложного отказа, когда ответ в документах есть.
+Верни итоговый ответ: один абзац 40–90 слов, с точными ссылками на пункт/статью, в том же деловом стиле. Если черновик полностью верен — верни его без изменений. Если в черновике есть факт, которого нет в документах, убери его. Никаких пояснений и комментариев — только текст ответа."""
+
+
+def hints_block(engine: SearchEngine, info: QueryInfo) -> str:
+    lines: list[str] = []
+    if info.event_text:
+        plan = edition_plan(engine.docs, info.event_ord)
+        applicable = sorted({v["applicable_edition"] for v in plan.values() if v["applicable"]})
+        current = sorted({v["current_edition"] for v in plan.values()})
+        lines.append(f"Дата события в вопросе: {info.event_text}.")
+        if applicable:
+            lines.append("Применимая на эту дату редакция: " + ", ".join(applicable) + ".")
+        if current and current != applicable:
+            lines.append("Действующая сейчас редакция: " + ", ".join(current)
+                         + " (к событию в прошлом не применяется).")
+    if info.doc_hits and not info.ambiguous:
+        labels = [doc_label(engine.docs[d]) for d in sorted(info.doc_hits)]
+        lines.append("Документы, о которых спрашивает пользователь: " + "; ".join(labels[:4])
+                     + ". Условия других договоров и контрагентов не используй.")
+    elif info.ambiguous:
+        lines.append("Название контрагента в вопросе неоднозначно: опирайся на уточнение из диалога "
+                     "и предмет закупки, не смешивай условия разных договоров.")
+    return "\n".join(lines)
+
+
+def suspicious_numbers(answer: str, context: str) -> list[str]:
+    ctx = context.replace("\u00a0", " ")
+    plain = set(re.findall(r"\d+", ctx))
+    glued = set(re.findall(r"\d+", re.sub(r"(?<=\d) (?=\d)", "", ctx)))
+    out: list[str] = []
+    for m in re.finditer(r"\d[\d \u00a0]*", answer):
+        raw = m.group(0).strip()
+        compact = re.sub(r"[ \u00a0]", "", raw)
+        if len(compact) < 2 or raw in ctx:
+            continue
+        if compact in plain or compact in glued:
+            continue
+        out.append(raw)
+    return out[:8]
+
+
+def clean_answer(text: str) -> str:
+    out = text.strip()
+    out = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", out).strip()
+    out = re.sub(r"^(?:ответ|answer)\s*:\s*", "", out, flags=re.I)
+    out = out.replace("**", "").replace("__", "")
+    out = re.sub(r"^\s*[-•*]\s+", "", out, flags=re.M)
+    out = re.sub(r"^#+\s*", "", out)
+    out = re.sub(r"\s*\n+\s*", " ", out)
+    out = re.sub(r"[ \t]{2,}", " ", out).strip()
+    if len(out) > 9500:
+        out = out[:9500].rsplit(" ", 1)[0] + "…"
+    return out
+
+
+def answer_question(engine: SearchEngine, question: str) -> str:
+    if left() < 25:
         return FALLBACK
-
-    context_blocks = []
-    for i, chunk in enumerate(chunks, 1):
-        context_blocks.append(f"--- Фрагмент {i} ---\n{chunk.text}")
-    context_str = "\n\n".join(context_blocks)
-
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Контекст из базы знаний:\n{context_str}\n\n"
-                    f"Вопрос пользователя:\n{question}"
-                ),
-            },
-        ],
-        "temperature": TEMPERATURE,
-        "max_tokens": MAX_TOKENS,
-    }
-
+    info = analyze(question, engine.docs, engine.own_orgs)
+    stage_dl = min(time.time() + 70, DEADLINE - 40)
+    info.search = rewrite(info, stage_dl)
+    selected = retrieve(engine, info, stage_dl)
+    context = assemble_context(engine, selected)
+    if not context.strip():
+        return FALLBACK
+    hints = hints_block(engine, info)
+    user = (
+        f"ВЫДЕРЖКИ ИЗ ДОКУМЕНТОВ:\n{context}\n\n"
+        + (f"ПОДСКАЗКИ ПО ВОПРОСУ:\n{hints}\n\n" if hints else "")
+        + f"ВОПРОС СОТРУДНИКА (если есть история диалога — отвечай на последнюю реплику "
+          f"пользователя с учётом истории):\n{question}\n\n"
+        + f"СПРАВОЧНО — КАТАЛОГ БАЗЫ ЗНАНИЙ (используй только чтобы понять, "
+          f"каких документов в базе нет):\n{engine.catalog}"
+    )
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
+    gen_timeout = max(30.0, min(180.0, left() - 20))
     try:
-        result = post_with_retry(client, "/chat/completions", LLM_KEY, payload, retries=4)
-        content = result["choices"][0]["message"].get("content", "")
-        if isinstance(content, str) and content.strip():
-            # Убираем возможные markdown-артефакты в начале/конце и соблюдаем лимит 10 000 символов
-            cleaned = content.strip()
-            if len(cleaned) > 9500:
-                cleaned = cleaned[:9500].rsplit(" ", 1)[0] + "..."
-            return cleaned
+        draft = clean_answer(chat(messages, max_tokens=ANSWER_TOKENS, temperature=TEMPERATURE,
+                                  retries=3, timeout=gen_timeout))
     except Exception as exc:
-        print(f"Ошибка генерации LLM: {type(exc).__name__}", file=sys.stderr)
+        warn(f"генерация не удалась ({type(exc).__name__})")
+        return FALLBACK
+    if not draft:
+        return FALLBACK
+    if not USE_VERIFY or left() < 100 or draft == FALLBACK:
+        return draft
+    bad = suspicious_numbers(draft, context)
+    check_user = user + f"\n\nЧЕРНОВИК ОТВЕТА:\n{draft}"
+    if bad:
+        check_user += ("\n\nОСОБО ПРОВЕРЬ ЧИСЛА, которых нет в тексте документов: "
+                       + ", ".join(bad) + ". Если подтверждения нет — убери их.")
+    try:
+        fixed = clean_answer(chat(
+            [{"role": "system", "content": VERIFY_SYSTEM}, {"role": "user", "content": check_user}],
+            max_tokens=ANSWER_TOKENS, temperature=0.0, retries=2,
+            timeout=max(30.0, min(150.0, left() - 15)),
+        ))
+    except Exception:
+        return draft
+    if fixed and 20 <= len(fixed) <= 9500:
+        return fixed
+    return draft
 
-    return FALLBACK
+
+# --------------------------------------------------------------------------- #
+# Ввод/вывод и orchestration
+# --------------------------------------------------------------------------- #
+QUESTIONS: list[tuple[str, str]] = []
+ANSWERS: list[str] = []
+CSV_LOCK = threading.Lock()
+
+
+def find_input(*names: str) -> Path | None:
+    roots = [DATA_DIR, Path.cwd(), Path(__file__).resolve().parent,
+             Path(__file__).resolve().parent / DATA_DIR, Path("data")]
+    for root in roots:
+        for name in names:
+            path = root / name
+            if path.exists():
+                return path
+    return None
+
+
+def find_kb() -> Path | None:
+    direct = find_input("knowledge-base.zip", "kb.zip", "knowledge_base.zip", "knowledge-base")
+    if direct is not None:
+        return direct
+    for root in (DATA_DIR, Path.cwd()):
+        if root.is_dir():
+            zips = sorted(p for p in root.glob("*.zip") if p.is_file())
+            if zips:
+                return zips[0]
+    return None
+
+
+def load_questions(path: Path) -> list[tuple[str, str]]:
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = {(f or "").strip().lower(): f for f in (reader.fieldnames or [])}
+        id_col = fields.get("id")
+        q_col = fields.get("question") or fields.get("query") or fields.get("text")
+        if not id_col or not q_col:
+            raise ValueError("в questions.csv нужны колонки id и question")
+        rows = []
+        for row in reader:
+            qid = str(row.get(id_col, "")).strip()
+            text = str(row.get(q_col, "")).strip()
+            if qid:
+                rows.append((qid, text))
+    return rows
+
+
+def write_submission() -> None:
+    with CSV_LOCK:
+        tmp = Path("submission.csv.tmp")
+        with tmp.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle, quoting=csv.QUOTE_ALL, lineterminator="\n")
+            writer.writerow(["id", "answer"])
+            for (qid, _), answer in zip(QUESTIONS, ANSWERS):
+                text = answer.strip() if answer and answer.strip() else FALLBACK
+                writer.writerow([qid, text[:9500]])
+        os.replace(tmp, "submission.csv")
+
 
 def main() -> None:
-    start_time = time.time()
-    if not API_BASE or not LLM_KEY:
-        raise ValueError("Нужны переменные окружения LLM_BASE_URL и LLM_API_KEY (или их аналоги)")
+    global QUESTIONS, ANSWERS
+    qpath = find_input("questions.csv", "demo_questions.csv")
+    if qpath is None:
+        raise FileNotFoundError("не найден questions.csv")
+    QUESTIONS = load_questions(qpath)
+    ANSWERS = [FALLBACK] * len(QUESTIONS)
+    write_submission()                       # файл валиден уже сейчас
+    log(f"вопросов: {len(QUESTIONS)} | бюджет: {RUN_BUDGET}c | workers={MAX_WORKERS}")
 
-    questions_path = find_file("questions.csv", "demo_questions.csv")
-    kb_path = find_file("kb.zip", "knowledge-base.zip", "knowledge_base.zip")
-
-
-    questions = load_questions(questions_path)
-    documents = load_documents(kb_path)
-    print(f"Загружено вопросов: {len(questions)}, документов: {len(documents)}", flush=True)
-
-    # Этап 1: Нарезка на родительские и дочерние чанки
-    parents, children = build_chunks(documents)
-    print(f"Сформировано чанков: {len(parents)} родительских, {len(children)} дочерних", flush=True)
-
-    # Этап 2: Построение гибридного индекса (BM25s + FAISS) один раз на весь запуск
-    index = build_hybrid_index(parents, children)
-    print(f"Индексация завершена за {time.time() - start_time:.1f} сек.", flush=True)
-
-    # Этап 3: Многопоточная обработка вопросов
-    def work(position: int, question: str) -> tuple[int, str]:
+    kb = find_kb()
+    if kb is None:
+        warn("база знаний не найдена — все ответы будут отказом")
+        return
+    docs: list[Doc] = []
+    for name, raw in iter_kb_files(kb):
         try:
-            with httpx.Client(timeout=90.0) as client:
-                selected_chunks = retrieve_context(client, question, index)
-                answer = generate_answer(client, question, selected_chunks)
-                return position, answer
+            text = parse_file(name, raw)
         except Exception as exc:
-            print(f"Критическая ошибка на вопросе {position}: {type(exc).__name__}", file=sys.stderr)
-            return position, FALLBACK
+            warn(f"пропущен {name}: {type(exc).__name__}")
+            continue
+        if text:
+            docs.append(make_doc(len(docs), name, text))
+    if not docs:
+        warn("в базе знаний нет читаемых документов")
+        return
+    log(f"документов: {len(docs)}")
+    if API_BASE and API_KEY:
+        discover_models()
+    engine = build_engine(docs)
+    log(f"индекс готов, осталось {left():.0f}c")
 
-    answers = [FALLBACK] * len(questions)
+    done = [0]
+    counter_lock = threading.Lock()
+
+    def work(index: int) -> None:
+        qid, question = QUESTIONS[index]
+        if not question:
+            return
+        try:
+            answer = answer_question(engine, question)
+        except Exception as exc:
+            warn(f"вопрос {qid}: {type(exc).__name__}")
+            answer = FALLBACK
+        ANSWERS[index] = answer or FALLBACK
+        with counter_lock:
+            done[0] += 1
+            n = done[0]
+        if n % 5 == 0 or n == len(QUESTIONS):
+            write_submission()
+            log(f"готово {n}/{len(QUESTIONS)}, осталось {left():.0f}c")
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = [pool.submit(work, i, q) for i, (_, q) in enumerate(questions)]
-        for finished, future in enumerate(as_completed(futures), 1):
-            idx, ans = future.result()
-            answers[idx] = ans
-            if finished % 10 == 0 or finished == len(questions):
-                elapsed = time.time() - start_time
-                print(f"Обработано {finished}/{len(questions)} ({elapsed:.1f} сек.)", flush=True)
-
-    # Этап 4: Сохранение результата в строгом соответствии с форматом регламента
-    with open("submission.csv", "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f, quoting=csv.QUOTE_ALL, lineterminator="\n")
-        writer.writerow(["id", "answer"])
-        for i, (qid, _) in enumerate(questions):
-            safe_answer = answers[i] if answers[i].strip() else FALLBACK
-            writer.writerow([qid, safe_answer])
-
-    print(f"Готово! Создан submission.csv ({len(questions)} строк) за {time.time() - start_time:.1f} сек.", flush=True)
+        list(pool.map(work, range(len(QUESTIONS))))
+    write_submission()
+    refusals = sum(1 for a in ANSWERS if a == FALLBACK)
+    log(f"submission.csv записан: {len(ANSWERS)} строк, отказов {refusals}, "
+        f"время {time.time() - T0:.0f}c")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        warn(f"фатальная ошибка: {type(exc).__name__}: {exc}")
+        try:
+            if QUESTIONS:
+                write_submission()
+        except Exception:
+            pass
+    sys.exit(0)
