@@ -60,9 +60,9 @@ EMB_MODEL = env("EMB_MODEL", "baai/bge-m3")
 RERANKER_MODEL = env("RERANKER_MODEL", "qwen/qwen3-reranker-8b")
 
 #расширил лимиты для качественного гибридного поиска
-RETRIEVAL_TOP_K = max(30, env_int("TOP_K", 30, 10, 100))
-RERANKER_TOP_N = env_int("RERANKER_TOP_N", 6, 3, 15)
-MAX_TOKENS = env_int("MAX_TOKENS", 600, 128, 8192)
+RETRIEVAL_TOP_K = max(30, env_int("TOP_K", 60, 20, 150))
+RERANKER_TOP_N = env_int("RERANKER_TOP_N", 8, 4, 15)
+MAX_TOKENS = env_int("MAX_TOKENS", 1000, 128, 8192)
 MAX_WORKERS = env_int("MAX_WORKERS", 4, 1, 16)
 TEMPERATURE = env_float("TEMPERATURE", 0.0)
 CHUNKER = env("CHUNKER", "common")
@@ -97,18 +97,43 @@ def load_questions(path: Path) -> list[tuple[str, str]]:
     return rows
 
 
+#добваил возможность чтения таблиц 
 def read_docx(raw: bytes) -> str:
-    # DOCX — это ZIP с XML. Пример обходится без дополнительной библиотеки.
+    """Читает DOCX с сохранением порядка следования абзацев и Markdown-разметкой таблиц."""
     with zipfile.ZipFile(io.BytesIO(raw)) as doc:
         xml = doc.read("word/document.xml")
     root = ET.fromstring(xml)
     ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    paragraphs = []
-    for p in root.iter(ns + "p"):
-        line = "".join(x.text or "" for x in p.iter(ns + "t")).strip()
-        if line: 
-            paragraphs.append(line)
-    return "\n".join(paragraphs)
+    body = root.find(ns + "body")
+    if body is None:
+        return ""
+
+    blocks: list[str] = []
+    for child in body:
+        if child.tag == ns + "p":
+            line = "".join(t.text or "" for t in child.iter(ns + "t")).strip()
+            if line:
+                blocks.append(line)
+        elif child.tag == ns + "tbl":
+            table_rows: list[str] = []
+            for r_idx, tr in enumerate(child.iter(ns + "tr")):
+                cells: list[str] = []
+                for tc in tr.iter(ns + "tc"):
+                    cell_parts = [
+                        "".join(t.text or "" for t in p.iter(ns + "t")).strip()
+                        for p in tc.iter(ns + "p")
+                    ]
+                    cell_text = " ".join(part for part in cell_parts if part)
+                    cells.append(cell_text)
+                if any(cells):
+                    table_rows.append("| " + " | ".join(cells) + " |")
+                    if r_idx == 0:
+                        table_rows.append("|" + "|".join(["---"] * len(cells)) + "|")
+            if table_rows:
+                blocks.append("\n".join(table_rows))
+
+    return "\n\n".join(blocks)
+
 
 #читаем pdf
 def read_pdf(raw: bytes) -> str:
@@ -467,11 +492,14 @@ DIALOGUE_MARKERS_RE = re.compile(
 )
 
 
-def rewrite_dialogue_query(client: httpx.Client, question: str) -> str:
-    """Если вопрос содержит историю диалога, переформулирует последний запрос в самодостаточный."""
-    # Одиночный короткий вопрос без маркеров диалога не требует лишнего вызова LLM
-    if "\n" not in question and not DIALOGUE_MARKERS_RE.search(question):
-        return question
+def generate_search_queries(client: httpx.Client, question: str) -> list[str]:
+    """Формирует 1–3 точечных поисковых запроса (раскрывает диалоги и декомпозирует сложные вопросы)."""
+    is_dialogue = "\n" in question or bool(DIALOGUE_MARKERS_RE.search(question))
+    words_count = len(question.split())
+
+    # Короткий одиночный вопрос не требует вызова LLM
+    if not is_dialogue and words_count <= 10:
+        return [question]
 
     payload = {
         "model": LLM_MODEL,
@@ -480,25 +508,40 @@ def rewrite_dialogue_query(client: httpx.Client, question: str) -> str:
                 "role": "system",
                 "content": (
                     "Ты — модуль подготовки поисковых запросов для юридической базы знаний. "
-                    "Тебе передана история диалога и последняя реплика пользователя. "
-                    "Перепиши последнюю реплику в один четкий, самодостаточный поисковый запрос, "
-                    "раскрыв все местоимения и контекст из предыдущих сообщений. "
-                    "Не отвечай на вопрос и не добавляй ничего от себя — верни только текст запроса."
+                    "Проанализируй вопрос пользователя (или историю диалога) и сформируй от 1 до 3 коротких, "
+                    "самодостаточных поисковых запросов для поиска по договорам и законам.\n"
+                    "Правила:\n"
+                    "1. Раскрой все местоимения и контекст из предыдущих реплик диалога.\n"
+                    "2. Если вопрос составной (спрашивается о нескольких условиях, сроках, штрафах или документах), "
+                    "разбей его на 2–3 отдельных поисковых запроса по каждой теме.\n"
+                    "3. Сохраняй точные номера договоров, статей, дат и названия компаний.\n"
+                    "4. Верни ТОЛЬКО сами запросы — каждый с новой строки, без нумерации и пояснений."
                 ),
             },
             {"role": "user", "content": question},
         ],
         "temperature": 0.0,
-        "max_tokens": 200,
+        "max_tokens": 250,
     }
     try:
         result = post_with_retry(client, "/chat/completions", LLM_KEY, payload, retries=2)
-        rewritten = result["choices"][0]["message"].get("content", "").strip()
-        if rewritten and len(rewritten) <= 1000:
-            return rewritten
+        raw_text = result["choices"][0]["message"].get("content", "").strip()
+        queries = [
+            re.sub(r"^[\-\*\d\.\)\s]+", "", line).strip()
+            for line in raw_text.splitlines()
+            if line.strip()
+        ]
+        # Оставляем до 3 уникальных непустых запросов
+        unique_queries: list[str] = []
+        for q in queries:
+            if 3 <= len(q) <= 500 and q not in unique_queries:
+                unique_queries.append(q)
+        if unique_queries:
+            return unique_queries[:3]
     except Exception as exc:
-        print(f"Query rewrite пропущен ({type(exc).__name__}), используем исходный вопрос", file=sys.stderr)
-    return question
+        print(f"Multi-query пропущен ({type(exc).__name__}), используем исходный вопрос", file=sys.stderr)
+
+    return [question]
 
 
 def rerank_parents(
@@ -540,75 +583,79 @@ def retrieve_context(
     index: HybridIndex,
     rrf_k: int = 60,
 ) -> list[ParentChunk]:
-    """Выполняет гибридный поиск (BM25s + FAISS), RRF-слияние и реранкинг."""
+    """Выполняет Multi-Query гибридный поиск (BM25s + FAISS), RRF-слияние и реранкинг."""
     if not index.children:
         return []
 
-    search_query = rewrite_dialogue_query(client, question)
+    search_queries = generate_search_queries(client, question)
+    primary_query = search_queries[0]
     k = min(RETRIEVAL_TOP_K, len(index.children))
     rrf_scores: dict[int, float] = {}
 
-    # 1. Лексический поиск BM25s
-    q_tokens = tokenize_ru(search_query)
-    if q_tokens:
+    # 1. Лексический поиск BM25s по всем подзапросам
+    for q in search_queries:
+        q_tokens = tokenize_ru(q)
+        if not q_tokens:
+            continue
         bm25_indices, _ = index.bm25.retrieve([q_tokens], k=k, show_progress=False)
         for rank, child_idx in enumerate(bm25_indices[0]):
             cid = int(child_idx)
             if 0 <= cid < len(index.children):
                 rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (rrf_k + rank + 1)
 
-    # 2. Векторный поиск FAISS (BAAI/bge-m3)
+    # 2. Векторный поиск FAISS батчем сразу по всем подзапросам (1 сетевой запрос)
     if index.faiss_index is not None:
         try:
-            q_vec = fetch_embeddings_batch(client, [search_query])
-            _, faiss_indices = index.faiss_index.search(q_vec, k)
-            for rank, child_idx in enumerate(faiss_indices[0]):
-                cid = int(child_idx)
-                if 0 <= cid < len(index.children):
-                    rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (rrf_k + rank + 1)
+            q_vecs = fetch_embeddings_batch(client, search_queries)
+            _, faiss_indices = index.faiss_index.search(q_vecs, k)
+            for row in faiss_indices:
+                for rank, child_idx in enumerate(row):
+                    cid = int(child_idx)
+                    if 0 <= cid < len(index.children):
+                        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (rrf_k + rank + 1)
         except Exception as exc:
             print(f"Ошибка векторного поиска ({type(exc).__name__}), используем BM25", file=sys.stderr)
 
-    # Если оба поиска ничего не вернули, берем первые чанки как страховку
     if not rrf_scores:
         sorted_child_ids = list(range(min(k, len(index.children))))
     else:
         sorted_child_ids = sorted(rrf_scores.keys(), key=lambda cid: rrf_scores[cid], reverse=True)
 
-    # 3. Агрегация оценок дочерних чанков на уровень родительских документов (Parent-Document)
+    # 3. Агрегация оценок дочерних чанков на уровень родительских документов
     parent_scores: dict[int, float] = {}
     for cid in sorted_child_ids:
         pid = index.children[cid].parent_id
-        # Суммируем RRF-вес дочерних чанков внутри одного родителя
         parent_scores[pid] = parent_scores.get(pid, 0.0) + rrf_scores.get(cid, 0.0)
 
-    # Берем топ-18 лучших уникальных родительских блоков для отправки в реранкер
-    rerank_pool_size = max(RERANKER_TOP_N * 3, 15)
+    # Передаем топ-24 уникальных родительских блока в Qwen3 Reranker 8B
+    rerank_pool_size = max(RERANKER_TOP_N * 3, 24)
     top_parent_ids = sorted(parent_scores.keys(), key=lambda pid: parent_scores[pid], reverse=True)[:rerank_pool_size]
     candidate_parents = [index.parents[pid] for pid in top_parent_ids]
 
-    # 4. Финальный реранкинг через Qwen3 Reranker 8B
+    # 4. Финальный реранкинг по объединенному поисковому запросу
+    rerank_query = " | ".join(search_queries) if len(search_queries) > 1 else primary_query
     try:
-        return rerank_parents(client, search_query, candidate_parents)
+        return rerank_parents(client, rerank_query, candidate_parents)
     except Exception as exc:
         print(f"Reranker недоступен ({type(exc).__name__}), возвращаем RRF-топ", file=sys.stderr)
         return candidate_parents[:RERANKER_TOP_N]
 
 
 SYSTEM_PROMPT = (
-    "Ты — юридический ассистент компании. Дай точный, краткий и фактологически безупречный ответ "
-    "на вопрос пользователя ИСКЛЮЧИТЕЛЬНО на основе предоставленных ниже фрагментов документов.\n\n"
+    "Ты — высокоточный юридический ассистент компании. Твоя задача — дать точный, аргументированный и фактологически "
+    "безупречный ответ на вопрос пользователя ИСКЛЮЧИТЕЛЬНО на основе предоставленных ниже фрагментов документов.\n\n"
     "Строгие правила:\n"
-    "1. Запрещено использовать внешние знания, законы или статьи, которых нет в переданных фрагментах. "
-    "Любой выдуманный факт или домысел недопустимы.\n"
+    "1. Запрещено использовать внешние знания, законы, судебную практику или статьи, которых нет в переданных фрагментах. "
+    "Любой выдуманный факт, домысел или экстраполяция недопустимы.\n"
     "2. Если информации для ответа в фрагментах нет — прямо напиши, что в базе знаний нет документов по этому вопросу, "
     "и откажись отвечать по памяти. Если в фрагментах есть только часть норм (например, упомянуты другие статьи, "
     "которых нет в тексте), укажи только то, что есть в базе, и отметь, каких статей/документов не хватает.\n"
     "3. Если пользователь в вопросе называет неверную цифру, срок или условие — прямо опровергни это со ссылкой на документ.\n"
     "4. Обращай внимание на даты и редакции документов: если вопрос касается события в прошлом, применяй редакцию регламента "
     "или договора, действовавшую на ту дату.\n"
-    "5. Формат ответа: один связный абзац (40–80 слов, без списков и лишних вступлений). Если вопрос предполагает «да/нет», "
-    "начни ответ со слова «Да.» или «Нет.». Обязательно укажи точный источник и пункт/статью.\n\n"
+    "5. Адаптивный объем и стиль: для простого вопроса дай ответ одним связным абзацем (40–90 слов). Для составного вопроса "
+    "с несколькими условиями, исключениями или табличными данными раскрой все детали полностью (до 180–220 слов). "
+    "Если вопрос предполагает «да/нет», начни ответ со слова «Да.» или «Нет.». Обязательно указывай точный источник и пункт/статью.\n\n"
     "Примеры эталонного стиля ответа:\n"
     "— Арендная плата по договору аренды № А-08/2024 с ООО «Северный Склад» — 450 000 рублей в месяц, включая НДС (п. 3.1). "
     "Вносится ежемесячно, не позднее 5-го числа текущего месяца (п. 3.2).\n"
@@ -616,10 +663,53 @@ SYSTEM_PROMPT = (
     "соглашений и локальных нормативных актов работодателя. Источник: ТК РФ, ст. 70."
 )
 
+VERIFY_PROMPT = (
+    "Ты — строгий юридический редактор-верификатор. Проверь черновик ответа на вопрос пользователя "
+    "по предоставленным фрагментам документов.\n\n"
+    "Твоя задача:\n"
+    "1. Сверь каждую цифру, сумму, дату, срок, название документа и номер статьи/пункта в черновике с текстом фрагментов.\n"
+    "2. Удали или исправь любое утверждение, вывод или ссылку, которые прямо не подтверждены фрагментами.\n"
+    "3. Если весь черновик основан на домыслах и подтверждений в тексте нет, замени его на: "
+    "«В базе знаний нет документов по данному вопросу, поэтому ответить по документам я не могу. "
+    "По памяти отвечать не буду, так как нормы могли измениться. Для ответа обратитесь к юристу.»\n"
+    "4. Верни ТОЛЬКО итоговый исправленный текст ответа без комментариев о проверке."
+)
+
+
+def verify_answer(client: httpx.Client, question: str, context_str: str, draft: str) -> str:
+    """Второй проход: удаляет из черновика любые недоказанные факты, цифры и статьи."""
+    # Если модель уже честно отказалась отвечать, повторная проверка не нужна
+    if "нет документов по данному вопросу" in draft.lower() or "отсутствует информация" in draft.lower():
+        return draft
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": VERIFY_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Исходные фрагменты документов:\n{context_str}\n\n"
+                    f"Вопрос пользователя:\n{question}\n\n"
+                    f"Черновик ответа для проверки:\n{draft}"
+                ),
+            },
+        ],
+        "temperature": 0.0,
+        "max_tokens": MAX_TOKENS,
+    }
+    try:
+        result = post_with_retry(client, "/chat/completions", LLM_KEY, payload, retries=2)
+        verified = result["choices"][0]["message"].get("content", "").strip()
+        if verified:
+            return verified
+    except Exception as exc:
+        print(f"Верификация пропущена ({type(exc).__name__}), оставляем черновик", file=sys.stderr)
+    return draft
 
 
 def generate_answer(client: httpx.Client, question: str, chunks: list[ParentChunk]) -> str:
-    """Генерирует юридически обоснованный ответ строго по отобранным родительским фрагментам."""
+    """Генерирует юридически обоснованный ответ и проводит анти-галлюцинационный аудит."""
     if not chunks:
         return FALLBACK
 
@@ -648,15 +738,17 @@ def generate_answer(client: httpx.Client, question: str, chunks: list[ParentChun
         result = post_with_retry(client, "/chat/completions", LLM_KEY, payload, retries=4)
         content = result["choices"][0]["message"].get("content", "")
         if isinstance(content, str) and content.strip():
-            # Убираем возможные markdown-артефакты в начале/конце и соблюдаем лимит 10 000 символов
-            cleaned = content.strip()
-            if len(cleaned) > 9500:
-                cleaned = cleaned[:9500].rsplit(" ", 1)[0] + "..."
-            return cleaned
+            draft = content.strip()
+            # Второй этап: защита от обнуления балла за галлюцинации
+            final_answer = verify_answer(client, question, context_str, draft)
+            if len(final_answer) > 9500:
+                final_answer = final_answer[:9500].rsplit(" ", 1)[0] + "..."
+            return final_answer
     except Exception as exc:
         print(f"Ошибка генерации LLM: {type(exc).__name__}", file=sys.stderr)
 
     return FALLBACK
+
 
 def main() -> None:
     start_time = time.time()
