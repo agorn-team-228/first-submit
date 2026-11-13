@@ -100,7 +100,7 @@ def read_docx(raw: bytes) -> str:
     with zipfile.ZipFile(io.BytesIO(raw)) as doc:
         xml = doc.read("word/document.xml")
     root = ET.fromstring(xml)
-    ns = "{http://openxmlformats.org}"
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
     paragraphs = []
     for p in root.iter(ns + "p"):
         line = "".join(x.text or "" for x in p.iter(ns + "t")).strip()
@@ -125,14 +125,37 @@ def read_html(raw: bytes) -> str:
 
 
 
+def fix_zip_filename(name: str, flag_bits: int) -> str:
+    """Исправляет все виды битых кодировок русских имен файлов в ZIP (CP437/CP866 <-> UTF-8)."""
+    if "╨" in name or "╤" in name:
+        try:
+            return name.encode("cp866").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    if flag_bits & 0x800:
+        return name
+    try:
+        raw_bytes = name.encode("cp437")
+        for enc in ("utf-8", "cp866", "cp1251"):
+            try:
+                return raw_bytes.decode(enc)
+            except UnicodeDecodeError:
+                continue
+    except UnicodeEncodeError:
+        pass
+    return name
+
+
 def load_documents(path: Path) -> list[tuple[str, str]]:
     documents = []
     with zipfile.ZipFile(path) as archive:
-        for name in sorted(archive.namelist()):
-            if name.endswith("/") or name.startswith("__MACOSX/"):
+        for info in sorted(archive.infolist(), key=lambda x: x.filename):
+            raw_name = info.filename
+            if raw_name.endswith("/") or raw_name.startswith("__MACOSX/"):
                 continue
-            suffix = Path(name).suffix.lower()
-            raw = archive.read(name)
+            clean_name = fix_zip_filename(raw_name, info.flag_bits)
+            suffix = Path(clean_name).suffix.lower()
+            raw = archive.read(raw_name)
             try:
                 if suffix == ".docx":
                     text = read_docx(raw)
@@ -143,32 +166,19 @@ def load_documents(path: Path) -> list[tuple[str, str]]:
                 elif suffix in {".txt", ".md", ".csv", ".json"}:
                     text = raw.decode("utf-8-sig", errors="replace")
                 else:
-                    with zipfile.ZipFile(path) as archive:
-                        for info in sorted(archive.infolist(), key=lambda x: x.filename):
-                            raw_name = info.filename
-                            if raw_name.endswith("/") or raw_name.startswith("__MACOSX/"):
-                                continue
-                            clean_name = fix_zip_filename(raw_name, info.flag_bits)
-                            try:
-                                text = _parse_bytes(clean_name, archive.read(raw_name))
-                            except Exception as exc:
-                                print(f"Пропущен нечитаемый документ {clean_name}: {type(exc).__name__}", file=sys.stderr)
-                                continue
-                            if text:
-                                cleaned = re.sub(r"\n{3,}", "\n\n", text).strip()
-                                if cleaned:
-                                    documents.append((clean_name, cleaned))
+                    continue
             except Exception as exc:
-                print(f"Пропущен нечитаемый документ {name}: {type(exc).__name__}", file=sys.stderr)
+                print(f"Пропущен нечитаемый документ {clean_name}: {type(exc).__name__}", file=sys.stderr)
                 continue
 
-            # Убираем лишние пустые строки, сохраняя структуру абзацев
             cleaned = re.sub(r"\n{3,}", "\n\n", text).strip()
             if cleaned:
-                documents.append((name, cleaned))
+                documents.append((clean_name, cleaned))
+
     if not documents:
         raise ValueError("В архиве базы знаний нет читаемых документов")
     return documents
+
 
 
 
@@ -589,37 +599,6 @@ def generate_answer(client: httpx.Client, question: str, chunks: list[ParentChun
         print(f"Ошибка генерации LLM: {type(exc).__name__}", file=sys.stderr)
 
     return FALLBACK
-
-#что бы установить норм кодировку
-def fix_zip_filename(name: str, flag_bits: int) -> str:
-    """Исправляет все виды битых кодировок русских имен файлов в ZIP (CP437/CP866 <-> UTF-8)."""
-    # Случай 1: Имя уже прочитано Python как UTF-8, но внутри лежат символы '╨'/'╤' (двойная кодировка CP866)
-    if "╨" in name or "╤" in name:
-        try:
-            return name.encode("cp866").decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            pass
-
-    # Случай 2: Стандартный флаг UTF-8 без двойной перекодировки
-    if flag_bits & 0x800:
-        return name
-
-    # Случай 3: Флаг UTF-8 не стоит, Python прочитал байты как CP437
-    try:
-        raw_bytes = name.encode("cp437")
-        for enc in ("utf-8", "cp866", "cp1251"):
-            try:
-                return raw_bytes.decode(enc)
-            except UnicodeDecodeError:
-                continue
-    except UnicodeEncodeError:
-        pass
-
-    return name
-
-
-
-
 
 def main() -> None:
     start_time = time.time()
