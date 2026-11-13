@@ -211,82 +211,129 @@ class ChildChunk:
     text: str
 
 #Регулярное выражение для поиска юредических заголовков 
-HEADER_RE = re.compile(
-    r"^(?:#{1,4}\s+.+|(?:Раздел|Глава|Статья|Пункт|Приложение)\s+[0-9IVXLCDM]+[\.\d]*.*)$",
-    re.IGNORECASE,
-)
+_KB_HEADINGS = [
+    (1, re.compile(r"^#\s+(.+)$")),
+    (2, re.compile(r"^#{2}\s+(.+)$")),
+    (3, re.compile(r"^#{3,6}\s+(.+)$")),
+    (1, re.compile(r"^(?:ЧАСТЬ|Часть)\s+[IVXLCDM\d]+.*$")),
+    (2, re.compile(r"^(?:ГЛАВА|Глава)\s+[IVXLCDM\d]+.*$")),
+    (3, re.compile(r"^(?:РАЗДЕЛ|Раздел)\s+[IVXLCDM\d]+.*$")),
+    (4, re.compile(r"^(?:Статья|Ст\.)\s*\d+(?:\.\d+)*\.?.*$")),
+    
+]
 
-def extract_selection_header(text: str, fallback_header: str) -> str:
-    """ищем ближайший юредический заголовок в начале фрагмента"""
-    for line in text.splitlines()[:5]:
-        clean = line.strip()
-        if 3 <= len(clean) <= 140 and HEADER_RE.match(clean):
-            return clean
-    return fallback_header
+
+def _kb_heading(line: str) -> tuple[int, str] | None:
+    """Если строка — юридический или структурный заголовок, возвращает (уровень, текст)."""
+    if not line or len(line) > 160:
+        return None
+    for level, pattern in _KB_HEADINGS:
+        m = pattern.match(line)
+        if m:
+            title = m.group(1) if m.groups() else line
+            return level, title.strip().rstrip("#").strip()[:120]
+    if 8 <= len(line) <= 90 and line == line.upper() and any(c.isalpha() for c in line) and not line.endswith("."):
+        return 2, line.strip()
+    return None
+
+
+def _kb_sections(text: str) -> list[tuple[str, str]]:
+    """Разбивает документ на логические секции со стеком заголовков (Глава > Раздел > Статья)."""
+    sections: list[tuple[str, str]] = []
+    stack: list[tuple[int, str]] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        body = "\n".join(buf).strip()
+        if body:
+            sections.append((" > ".join(t for _, t in stack), body))
+
+    for line in text.splitlines():
+        clean_line = line.strip()
+        h = _kb_heading(clean_line)
+        if h:
+            flush()
+            buf = [clean_line]
+            level, title = h
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, title))
+        else:
+            buf.append(line)
+    flush()
+    return sections
+
 
 def build_chunks(
     documents: list[tuple[str, str]],
     parent_size: int = 1000,
     parent_overlap: int = 150,
-    child_size: int = 250, 
-    child_overlap: int = 40, 
+    child_size: int = 250,
+    child_overlap: int = 40,
 ) -> tuple[list[ParentChunk], list[ChildChunk]]:
-    """Разбиваем документ на крупные родительские блоки и мелкие дочерние"""
+    """Строит Parent-Document чанки с иерархическими хлебными крошками."""
     parent_splitter = RecursiveCharacterTextSplitter(
-        chunk_size = parent_size, 
-        chunk_overlap = parent_overlap,
-        length_function = count_tockens,
-        separators = ["\n\n", "\n", ". ", "; ", " ", ""],
+        chunk_size=parent_size,
+        chunk_overlap=parent_overlap,
+        length_function=count_tockens,
+        separators=["\n\n", "\n", ". ", "; ", " ", ""],
     )
     child_splitter = RecursiveCharacterTextSplitter(
         chunk_size=child_size,
         chunk_overlap=child_overlap,
-        length_function = count_tockens,
+        length_function=count_tockens,
         separators=["\n\n", "\n", ". ", "; ", " ", ""],
     )
+
     parents: list[ParentChunk] = []
     children: list[ChildChunk] = []
 
     for doc_name, full_text in documents:
-        clean_doc_name = Path(doc_name).stem.replace("_", " ").strip()
-        current_header = clean_doc_name
+        clean_doc_name = str(Path(doc_name).with_suffix("")).replace("_", " ").strip()
+        sections = _kb_sections(full_text) or [("", full_text)]
 
-        parent_texts = parent_splitter.split_text(full_text)
-        for p_text in parent_texts:
-            p_text = p_text.strip()
-            if not p_text:
-                continue
-
-            current_header = extract_selection_header(p_text, current_header)
-            parent_id = len(parents)
-            #Обогощаем родительский чанк контекстом документа и раздела
-            enriched_parent = f"[Документ: {clean_doc_name} | Раздел: {current_header}]\n{p_text}"
-            parents.append(
-                ParentChunk(
-                    parent_id=parent_id,
-                    doc_name=clean_doc_name,
-                    header=current_header,
-                    text=enriched_parent,
-                )
+        for crumb, section_body in sections:
+            full_header = f"{clean_doc_name} > {crumb}" if crumb else clean_doc_name
+            parent_texts = (
+                [section_body]
+                if CHUNKER.strip().lower() in ("off", "none", "disabled")
+                else parent_splitter.split_text(section_body)
             )
 
-            child_texts = child_splitter.split_text(p_text)
-            for c_text in child_texts:
-                c_text = c_text.strip()
-                if not c_text:
+            for p_text in parent_texts:
+                p_text = p_text.strip()
+                if not p_text:
                     continue
-                #Дочерний  чанк тоже получит шапку  - это улучшит поиск
-                enriched_child = f"{clean_doc_name} | {current_header}\n{c_text}"
-                children.append(
-                    ChildChunk(
-                        child_id=len(children),
+
+                parent_id = len(parents)
+                enriched_parent = f"[Документ: {clean_doc_name} | Раздел: {full_header}]\n{p_text}"
+                parents.append(
+                    ParentChunk(
                         parent_id=parent_id,
                         doc_name=clean_doc_name,
-                        header=current_header,
-                        text=enriched_child,
+                        header=full_header,
+                        text=enriched_parent,
                     )
                 )
+
+                child_texts = child_splitter.split_text(p_text)
+                for c_text in child_texts:
+                    c_text = c_text.strip()
+                    if not c_text:
+                        continue
+                    enriched_child = f"{full_header}\n{c_text}"
+                    children.append(
+                        ChildChunk(
+                            child_id=len(children),
+                            parent_id=parent_id,
+                            doc_name=clean_doc_name,
+                            header=full_header,
+                            text=enriched_child,
+                        )
+                    )
+
     return parents, children
+
 
 TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+(?:[\.\-][0-9A-Za-zА-Яа-яЁё]+)*")
 
