@@ -1,0 +1,11 @@
+﻿.env
+data/
+solution_hybrid.py
+__pycache__/
+*.pyc
+report*.csv
+report*.json
+kb.txt
+questions.csv
+golden.json
+sanity*
