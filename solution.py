@@ -60,10 +60,10 @@ EMB_MODEL = env("EMB_MODEL", "baai/bge-m3")
 RERANKER_MODEL = env("RERANKER_MODEL", "qwen/qwen3-reranker-8b")
 
 #расширил лимиты для качественного гибридного поиска
-RETRIEVAL_TOP_K = max(30, env_int("TOP_K", 60, 20, 150))
-RERANKER_TOP_N = env_int("RERANKER_TOP_N", 8, 4, 15)
-MAX_TOKENS = env_int("MAX_TOKENS", 1000, 128, 8192)
-MAX_WORKERS = env_int("MAX_WORKERS", 4, 1, 16)
+RETRIEVAL_TOP_K = max(50, env_int("TOP_K", 50, 20, 120))
+RERANKER_TOP_N = env_int("RERANKER_TOP_N", 5, 3, 10)
+MAX_TOKENS = env_int("MAX_TOKENS", 550, 128, 8192)
+MAX_WORKERS = env_int("MAX_WORKERS", 6, 1, 16)
 TEMPERATURE = env_float("TEMPERATURE", 0.0)
 CHUNKER = env("CHUNKER", "common")
 
@@ -293,10 +293,10 @@ def _kb_sections(text: str) -> list[tuple[str, str]]:
 
 def build_chunks(
     documents: list[tuple[str, str]],
-    parent_size: int = 1000,
-    parent_overlap: int = 150,
-    child_size: int = 250,
-    child_overlap: int = 40,
+    parent_size: int = 600,
+    parent_overlap: int = 100,
+    child_size: int = 200,
+    child_overlap: int = 35,
 ) -> tuple[list[ParentChunk], list[ChildChunk]]:
     """Строит Parent-Document чанки с иерархическими хлебными крошками."""
     parent_splitter = RecursiveCharacterTextSplitter(
@@ -371,11 +371,10 @@ def tokenize_ru(text: str) -> list[str]:
     for tok in raw_tokens:
         if len(tok) <= 1:
             continue
+        tokens.append(tok)
         # Для длинных русских слов отсекаем 2 последних символа 
         if len(tok) >= 6 and tok.isalpha():
             tokens.append(tok[:-2])
-        else:
-            tokens.append(tok)
     return tokens        
 
 @dataclass
@@ -568,12 +567,32 @@ def rerank_parents(
     )
     items = result.get("results", result.get("data", []))
     ranked: list[ParentChunk] = []
-    seen = set()
+    seen_indices: set[int] = set()
+    doc_counts: dict[str, int] = {}
+    max_per_doc = 2
+
+    # Первый проход: берем лучшие чанки с ограничением не более 2 на один документ
     for item in items:
         idx = int(item["index"])
-        if 0 <= idx < len(candidates) and idx not in seen:
-            seen.add(idx)
-            ranked.append(candidates[idx])
+        if 0 <= idx < len(candidates) and idx not in seen_indices:
+            cand = candidates[idx]
+            if doc_counts.get(cand.doc_name, 0) < max_per_doc:
+                seen_indices.add(idx)
+                doc_counts[cand.doc_name] = doc_counts.get(cand.doc_name, 0) + 1
+                ranked.append(cand)
+                if len(ranked) >= top_n:
+                    break
+
+    # Второй проход: если уникальных документов не хватило до top_n, добираем оставшиеся лучшие
+    if len(ranked) < top_n:
+        for item in items:
+            idx = int(item["index"])
+            if 0 <= idx < len(candidates) and idx not in seen_indices:
+                seen_indices.add(idx)
+                ranked.append(candidates[idx])
+                if len(ranked) >= top_n:
+                    break
+
     return ranked[:top_n] if ranked else candidates[:top_n]
 
 
@@ -642,80 +661,34 @@ def retrieve_context(
 
 
 SYSTEM_PROMPT = (
-    "Ты — высокоточный юридический ассистент компании. Твоя задача — дать точный, аргументированный и фактологически "
-    "безупречный ответ на вопрос пользователя ИСКЛЮЧИТЕЛЬНО на основе предоставленных ниже фрагментов документов.\n\n"
+    "Ты — юридический ассистент компании. Дай точный, фактологически безупречный и максимально лаконичный ответ "
+    "на вопрос пользователя ИСКЛЮЧИТЕЛЬНО на основе предоставленных ниже фрагментов документов.\n\n"
     "Строгие правила:\n"
-    "1. Запрещено использовать внешние знания, законы, судебную практику или статьи, которых нет в переданных фрагментах. "
-    "Любой выдуманный факт, домысел или экстраполяция недопустимы.\n"
-    "2. Если информации для ответа в фрагментах нет — прямо напиши, что в базе знаний нет документов по этому вопросу, "
-    "и откажись отвечать по памяти. Если в фрагментах есть только часть норм (например, упомянуты другие статьи, "
-    "которых нет в тексте), укажи только то, что есть в базе, и отметь, каких статей/документов не хватает.\n"
-    "3. Если пользователь в вопросе называет неверную цифру, срок или условие — прямо опровергни это со ссылкой на документ.\n"
-    "4. Обращай внимание на даты и редакции документов: если вопрос касается события в прошлом, применяй редакцию регламента "
-    "или договора, действовавшую на ту дату.\n"
-    "5. Адаптивный объем и стиль: для простого вопроса дай ответ одним связным абзацем (40–90 слов). Для составного вопроса "
-    "с несколькими условиями, исключениями или табличными данными раскрой все детали полностью (до 180–220 слов). "
-    "Если вопрос предполагает «да/нет», начни ответ со слова «Да.» или «Нет.». Обязательно указывай точный источник и пункт/статью.\n\n"
-    "Примеры эталонного стиля ответа:\n"
+    "1. Запрещено использовать внешние знания, законы или статьи, которых нет в переданных фрагментах. "
+    "Любой выдуманный факт или домысел недопустимы.\n"
+    "2. Если информации для ответа в фрагментах нет — напиши: «В базе знаний нет документов по данному вопросу, "
+    "поэтому ответить по документам я не могу. По памяти отвечать не буду, так как нормы могли измениться. "
+    "Для ответа обратитесь к юристу.» Если в тексте упомянуты другие статьи, которых нет в базе — прямо укажи, "
+    "что этих статей в базе нет.\n"
+    "3. Приоритет редакций: если в фрагментах есть несколько редакций одного регламента или закона, всегда применяй "
+    "самую свежую (действующую) редакцию, если только в вопросе прямо не указана дата события из прошлого.\n"
+    "4. Если пользователь в вопросе называет неверную цифру, срок или условие — прямо опровергни это со ссылкой на документ.\n"
+    "5. Формат ответа: ОДИН плотный абзац строго на 40–75 слов (без списков, заголовков и вводных фраз). "
+    "Если вопрос предполагает «да/нет», начни со слова «Да.» или «Нет.». В конце или в скобках укажи точный документ и пункт/статью.\n\n"
+    "Эталоны стиля:\n"
     "— Арендная плата по договору аренды № А-08/2024 с ООО «Северный Склад» — 450 000 рублей в месяц, включая НДС (п. 3.1). "
     "Вносится ежемесячно, не позднее 5-го числа текущего месяца (п. 3.2).\n"
     "— Да. Во время испытания на работника распространяются положения трудового законодательства, коллективного договора, "
     "соглашений и локальных нормативных актов работодателя. Источник: ТК РФ, ст. 70."
 )
 
-VERIFY_PROMPT = (
-    "Ты — строгий юридический редактор-верификатор. Проверь черновик ответа на вопрос пользователя "
-    "по предоставленным фрагментам документов.\n\n"
-    "Твоя задача:\n"
-    "1. Сверь каждую цифру, сумму, дату, срок, название документа и номер статьи/пункта в черновике с текстом фрагментов.\n"
-    "2. Удали или исправь любое утверждение, вывод или ссылку, которые прямо не подтверждены фрагментами.\n"
-    "3. Если весь черновик основан на домыслах и подтверждений в тексте нет, замени его на: "
-    "«В базе знаний нет документов по данному вопросу, поэтому ответить по документам я не могу. "
-    "По памяти отвечать не буду, так как нормы могли измениться. Для ответа обратитесь к юристу.»\n"
-    "4. Верни ТОЛЬКО итоговый исправленный текст ответа без комментариев о проверке."
-)
-
-
-def verify_answer(client: httpx.Client, question: str, context_str: str, draft: str) -> str:
-    """Второй проход: удаляет из черновика любые недоказанные факты, цифры и статьи."""
-    # Если модель уже честно отказалась отвечать, повторная проверка не нужна
-    if "нет документов по данному вопросу" in draft.lower() or "отсутствует информация" in draft.lower():
-        return draft
-
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": VERIFY_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Исходные фрагменты документов:\n{context_str}\n\n"
-                    f"Вопрос пользователя:\n{question}\n\n"
-                    f"Черновик ответа для проверки:\n{draft}"
-                ),
-            },
-        ],
-        "temperature": 0.0,
-        "max_tokens": MAX_TOKENS,
-    }
-    try:
-        result = post_with_retry(client, "/chat/completions", LLM_KEY, payload, retries=2)
-        verified = result["choices"][0]["message"].get("content", "").strip()
-        if verified:
-            return verified
-    except Exception as exc:
-        print(f"Верификация пропущена ({type(exc).__name__}), оставляем черновик", file=sys.stderr)
-    return draft
-
 
 def generate_answer(client: httpx.Client, question: str, chunks: list[ParentChunk]) -> str:
-    """Генерирует юридически обоснованный ответ и проводит анти-галлюцинационный аудит."""
+    """Генерирует эталонный краткий юридический ответ строго по отобранным фрагментам."""
     if not chunks:
         return FALLBACK
 
-    context_blocks = []
-    for i, chunk in enumerate(chunks, 1):
-        context_blocks.append(f"--- Фрагмент {i} ---\n{chunk.text}")
+    context_blocks = [f"--- Фрагмент {i} ---\n{chunk.text}" for i, chunk in enumerate(chunks, 1)]
     context_str = "\n\n".join(context_blocks)
 
     payload = {
@@ -724,10 +697,7 @@ def generate_answer(client: httpx.Client, question: str, chunks: list[ParentChun
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": (
-                    f"Контекст из базы знаний:\n{context_str}\n\n"
-                    f"Вопрос пользователя:\n{question}"
-                ),
+                "content": f"Контекст из базы знаний:\n{context_str}\n\nВопрос пользователя:\n{question}",
             },
         ],
         "temperature": TEMPERATURE,
@@ -738,12 +708,10 @@ def generate_answer(client: httpx.Client, question: str, chunks: list[ParentChun
         result = post_with_retry(client, "/chat/completions", LLM_KEY, payload, retries=4)
         content = result["choices"][0]["message"].get("content", "")
         if isinstance(content, str) and content.strip():
-            draft = content.strip()
-            # Второй этап: защита от обнуления балла за галлюцинации
-            final_answer = verify_answer(client, question, context_str, draft)
-            if len(final_answer) > 9500:
-                final_answer = final_answer[:9500].rsplit(" ", 1)[0] + "..."
-            return final_answer
+            cleaned = " ".join(content.strip().split())
+            if len(cleaned) > 9500:
+                cleaned = cleaned[:9500].rsplit(" ", 1)[0] + "..."
+            return cleaned
     except Exception as exc:
         print(f"Ошибка генерации LLM: {type(exc).__name__}", file=sys.stderr)
 
