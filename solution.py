@@ -99,7 +99,7 @@ def load_questions(path: Path) -> list[tuple[str, str]]:
     return rows
 
 
-#добваил возможность чтения таблиц 
+
 def read_docx(raw: bytes) -> str:
     """Читает DOCX с сохранением порядка следования абзацев и Markdown-разметкой таблиц."""
     with zipfile.ZipFile(io.BytesIO(raw)) as doc:
@@ -502,7 +502,7 @@ def rewrite_dialogue_query(client: httpx.Client, question: str) -> str:
         ],
         "temperature": 0.0,
 
-=======
+
         "max_tokens": 200,
     }
     try:
