@@ -102,7 +102,7 @@ SEED = [
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--kb-zip", default="data/kb.zip")
+    ap.add_argument("--kb-zip", default="data/knowledge-base.zip")
     ap.add_argument("--kb", default="")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--target", type=int, default=100)

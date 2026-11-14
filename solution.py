@@ -61,8 +61,8 @@ RERANKER_MODEL = env("RERANKER_MODEL", "qwen/qwen3-reranker-8b")
 
 #расширил лимиты для качественного гибридного поиска
 RETRIEVAL_TOP_K = max(30, env_int("TOP_K", 30, 10, 100))
-RERANKER_TOP_N = env_int("RERANKER_TOP_N", 6, 3, 15)
-MAX_TOKENS = env_int("MAX_TOKENS", 600, 128, 8192)
+RERANKER_TOP_N = env_int("RERANKER_TOP_N", 8, 3, 15)
+MAX_TOKENS = env_int("MAX_TOKENS", 1024, 128, 8192)
 MAX_WORKERS = env_int("MAX_WORKERS", 4, 1, 16)
 TEMPERATURE = env_float("TEMPERATURE", 0.0)
 CHUNKER = env("CHUNKER", "common")
@@ -268,9 +268,9 @@ def _kb_sections(text: str) -> list[tuple[str, str]]:
 
 def build_chunks(
     documents: list[tuple[str, str]],
-    parent_size: int = 1000,
+    parent_size = 1500,
     parent_overlap: int = 150,
-    child_size: int = 250,
+    child_size = 400,
     child_overlap: int = 40,
 ) -> tuple[list[ParentChunk], list[ChildChunk]]:
     """Строит Parent-Document чанки с иерархическими хлебными крошками."""
@@ -579,9 +579,20 @@ def retrieve_context(
     parent_scores: dict[int, float] = {}
     for cid in sorted_child_ids:
         pid = index.children[cid].parent_id
-        # Суммируем RRF-вес дочерних чанков внутри одного родителя
-        parent_scores[pid] = parent_scores.get(pid, 0.0) + rrf_scores.get(cid, 0.0)
+        score = rrf_scores.get(cid, 0.0)
+        if pid not in parent_scores:
+            parent_scores[pid] = score
+        else:
+            parent_scores[pid] = max(parent_scores[pid], score) + 0.15 * min(parent_scores[pid], score)
 
+    # Бустинг по номерам статей, договоров и кодам документов (например, 145, 70, юо-7, а-08)
+    codes = set(re.findall(r"(?:[а-яa-z]+-\d+|\b\d{2,4}(?:/\d{4})?\b)", search_query.lower()))
+    if codes:
+        for pid in parent_scores:
+            header_lower = index.parents[pid].header.lower()
+            for code in codes:
+                if code in header_lower:
+                    parent_scores[pid] += 0.08
     # Берем топ-18 лучших уникальных родительских блоков для отправки в реранкер
     rerank_pool_size = max(RERANKER_TOP_N * 3, 15)
     top_parent_ids = sorted(parent_scores.keys(), key=lambda pid: parent_scores[pid], reverse=True)[:rerank_pool_size]
@@ -607,7 +618,7 @@ SYSTEM_PROMPT = (
     "3. Если пользователь в вопросе называет неверную цифру, срок или условие — прямо опровергни это со ссылкой на документ.\n"
     "4. Обращай внимание на даты и редакции документов: если вопрос касается события в прошлом, применяй редакцию регламента "
     "или договора, действовавшую на ту дату.\n"
-    "5. Формат ответа: один связный абзац (40–80 слов, без списков и лишних вступлений). Если вопрос предполагает «да/нет», "
+    "5. Формат ответа: связный текст без списков (60–140 слов). Если вопрос предполагает «да/нет», "
     "начни ответ со слова «Да.» или «Нет.». Обязательно укажи точный источник и пункт/статью.\n\n"
     "Примеры эталонного стиля ответа:\n"
     "— Арендная плата по договору аренды № А-08/2024 с ООО «Северный Склад» — 450 000 рублей в месяц, включая НДС (п. 3.1). "
