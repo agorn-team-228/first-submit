@@ -60,10 +60,12 @@ EMB_MODEL = env("EMB_MODEL", "baai/bge-m3")
 RERANKER_MODEL = env("RERANKER_MODEL", "qwen/qwen3-reranker-8b")
 
 #расширил лимиты для качественного гибридного поиска
-RETRIEVAL_TOP_K = max(50, env_int("TOP_K", 50, 20, 120))
-RERANKER_TOP_N = env_int("RERANKER_TOP_N", 5, 3, 10)
-MAX_TOKENS = env_int("MAX_TOKENS", 550, 128, 8192)
-MAX_WORKERS = env_int("MAX_WORKERS", 6, 1, 16)
+
+
+RETRIEVAL_TOP_K = max(30, env_int("TOP_K", 30, 10, 100))
+RERANKER_TOP_N = env_int("RERANKER_TOP_N", 8, 3, 15)
+MAX_TOKENS = env_int("MAX_TOKENS", 1024, 128, 8192)
+MAX_WORKERS = env_int("MAX_WORKERS", 4, 1, 16)
 TEMPERATURE = env_float("TEMPERATURE", 0.0)
 CHUNKER = env("CHUNKER", "common")
 
@@ -104,35 +106,13 @@ def read_docx(raw: bytes) -> str:
         xml = doc.read("word/document.xml")
     root = ET.fromstring(xml)
     ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    body = root.find(ns + "body")
-    if body is None:
-        return ""
 
-    blocks: list[str] = []
-    for child in body:
-        if child.tag == ns + "p":
-            line = "".join(t.text or "" for t in child.iter(ns + "t")).strip()
-            if line:
-                blocks.append(line)
-        elif child.tag == ns + "tbl":
-            table_rows: list[str] = []
-            for r_idx, tr in enumerate(child.iter(ns + "tr")):
-                cells: list[str] = []
-                for tc in tr.iter(ns + "tc"):
-                    cell_parts = [
-                        "".join(t.text or "" for t in p.iter(ns + "t")).strip()
-                        for p in tc.iter(ns + "p")
-                    ]
-                    cell_text = " ".join(part for part in cell_parts if part)
-                    cells.append(cell_text)
-                if any(cells):
-                    table_rows.append("| " + " | ".join(cells) + " |")
-                    if r_idx == 0:
-                        table_rows.append("|" + "|".join(["---"] * len(cells)) + "|")
-            if table_rows:
-                blocks.append("\n".join(table_rows))
-
-    return "\n\n".join(blocks)
+    paragraphs = []
+    for p in root.iter(ns + "p"):
+        line = "".join(x.text or "" for x in p.iter(ns + "t")).strip()
+        if line: 
+            paragraphs.append(line)
+    return "\n".join(paragraphs)
 
 
 #читаем pdf
@@ -293,10 +273,12 @@ def _kb_sections(text: str) -> list[tuple[str, str]]:
 
 def build_chunks(
     documents: list[tuple[str, str]],
-    parent_size: int = 600,
-    parent_overlap: int = 100,
-    child_size: int = 200,
-    child_overlap: int = 35,
+
+    parent_size = 1500,
+    parent_overlap: int = 150,
+    child_size = 400,
+    child_overlap: int = 40,
+
 ) -> tuple[list[ParentChunk], list[ChildChunk]]:
     """Строит Parent-Document чанки с иерархическими хлебными крошками."""
     parent_splitter = RecursiveCharacterTextSplitter(
@@ -371,10 +353,12 @@ def tokenize_ru(text: str) -> list[str]:
     for tok in raw_tokens:
         if len(tok) <= 1:
             continue
-        tokens.append(tok)
+
         # Для длинных русских слов отсекаем 2 последних символа 
         if len(tok) >= 6 and tok.isalpha():
             tokens.append(tok[:-2])
+        else:
+            tokens.append(tok)
     return tokens        
 
 @dataclass
@@ -491,14 +475,13 @@ DIALOGUE_MARKERS_RE = re.compile(
 )
 
 
-def generate_search_queries(client: httpx.Client, question: str) -> list[str]:
-    """Формирует 1–3 точечных поисковых запроса (раскрывает диалоги и декомпозирует сложные вопросы)."""
-    is_dialogue = "\n" in question or bool(DIALOGUE_MARKERS_RE.search(question))
-    words_count = len(question.split())
 
-    # Короткий одиночный вопрос не требует вызова LLM
-    if not is_dialogue and words_count <= 10:
-        return [question]
+def rewrite_dialogue_query(client: httpx.Client, question: str) -> str:
+    """Если вопрос содержит историю диалога, переформулирует последний запрос в самодостаточный."""
+    # Одиночный короткий вопрос без маркеров диалога не требует лишнего вызова LLM
+    if "\n" not in question and not DIALOGUE_MARKERS_RE.search(question):
+        return question
+
 
     payload = {
         "model": LLM_MODEL,
@@ -507,40 +490,30 @@ def generate_search_queries(client: httpx.Client, question: str) -> list[str]:
                 "role": "system",
                 "content": (
                     "Ты — модуль подготовки поисковых запросов для юридической базы знаний. "
-                    "Проанализируй вопрос пользователя (или историю диалога) и сформируй от 1 до 3 коротких, "
-                    "самодостаточных поисковых запросов для поиска по договорам и законам.\n"
-                    "Правила:\n"
-                    "1. Раскрой все местоимения и контекст из предыдущих реплик диалога.\n"
-                    "2. Если вопрос составной (спрашивается о нескольких условиях, сроках, штрафах или документах), "
-                    "разбей его на 2–3 отдельных поисковых запроса по каждой теме.\n"
-                    "3. Сохраняй точные номера договоров, статей, дат и названия компаний.\n"
-                    "4. Верни ТОЛЬКО сами запросы — каждый с новой строки, без нумерации и пояснений."
+
+                    "Тебе передана история диалога и последняя реплика пользователя. "
+                    "Перепиши последнюю реплику в один четкий, самодостаточный поисковый запрос, "
+                    "раскрыв все местоимения и контекст из предыдущих сообщений. "
+                    "Не отвечай на вопрос и не добавляй ничего от себя — верни только текст запроса."
+
                 ),
             },
             {"role": "user", "content": question},
         ],
         "temperature": 0.0,
-        "max_tokens": 250,
+
+=======
+        "max_tokens": 200,
     }
     try:
         result = post_with_retry(client, "/chat/completions", LLM_KEY, payload, retries=2)
-        raw_text = result["choices"][0]["message"].get("content", "").strip()
-        queries = [
-            re.sub(r"^[\-\*\d\.\)\s]+", "", line).strip()
-            for line in raw_text.splitlines()
-            if line.strip()
-        ]
-        # Оставляем до 3 уникальных непустых запросов
-        unique_queries: list[str] = []
-        for q in queries:
-            if 3 <= len(q) <= 500 and q not in unique_queries:
-                unique_queries.append(q)
-        if unique_queries:
-            return unique_queries[:3]
+        rewritten = result["choices"][0]["message"].get("content", "").strip()
+        if rewritten and len(rewritten) <= 1000:
+            return rewritten
     except Exception as exc:
-        print(f"Multi-query пропущен ({type(exc).__name__}), используем исходный вопрос", file=sys.stderr)
+        print(f"Query rewrite пропущен ({type(exc).__name__}), используем исходный вопрос", file=sys.stderr)
+    return question
 
-    return [question]
 
 
 def rerank_parents(
@@ -567,31 +540,13 @@ def rerank_parents(
     )
     items = result.get("results", result.get("data", []))
     ranked: list[ParentChunk] = []
-    seen_indices: set[int] = set()
-    doc_counts: dict[str, int] = {}
-    max_per_doc = 2
 
-    # Первый проход: берем лучшие чанки с ограничением не более 2 на один документ
+    seen = set()
     for item in items:
         idx = int(item["index"])
-        if 0 <= idx < len(candidates) and idx not in seen_indices:
-            cand = candidates[idx]
-            if doc_counts.get(cand.doc_name, 0) < max_per_doc:
-                seen_indices.add(idx)
-                doc_counts[cand.doc_name] = doc_counts.get(cand.doc_name, 0) + 1
-                ranked.append(cand)
-                if len(ranked) >= top_n:
-                    break
-
-    # Второй проход: если уникальных документов не хватило до top_n, добираем оставшиеся лучшие
-    if len(ranked) < top_n:
-        for item in items:
-            idx = int(item["index"])
-            if 0 <= idx < len(candidates) and idx not in seen_indices:
-                seen_indices.add(idx)
-                ranked.append(candidates[idx])
-                if len(ranked) >= top_n:
-                    break
+        if 0 <= idx < len(candidates) and idx not in seen:
+            seen.add(idx)
+            ranked.append(candidates[idx])
 
     return ranked[:top_n] if ranked else candidates[:top_n]
 
@@ -602,80 +557,96 @@ def retrieve_context(
     index: HybridIndex,
     rrf_k: int = 60,
 ) -> list[ParentChunk]:
-    """Выполняет Multi-Query гибридный поиск (BM25s + FAISS), RRF-слияние и реранкинг."""
+
+    """Выполняет гибридный поиск (BM25s + FAISS), RRF-слияние и реранкинг."""
     if not index.children:
         return []
 
-    search_queries = generate_search_queries(client, question)
-    primary_query = search_queries[0]
+    search_query = rewrite_dialogue_query(client, question)
     k = min(RETRIEVAL_TOP_K, len(index.children))
     rrf_scores: dict[int, float] = {}
 
-    # 1. Лексический поиск BM25s по всем подзапросам
-    for q in search_queries:
-        q_tokens = tokenize_ru(q)
-        if not q_tokens:
-            continue
+    # 1. Лексический поиск BM25s
+    q_tokens = tokenize_ru(search_query)
+    if q_tokens:
+
         bm25_indices, _ = index.bm25.retrieve([q_tokens], k=k, show_progress=False)
         for rank, child_idx in enumerate(bm25_indices[0]):
             cid = int(child_idx)
             if 0 <= cid < len(index.children):
                 rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (rrf_k + rank + 1)
 
-    # 2. Векторный поиск FAISS батчем сразу по всем подзапросам (1 сетевой запрос)
+
+    # 2. Векторный поиск FAISS (BAAI/bge-m3)
     if index.faiss_index is not None:
         try:
-            q_vecs = fetch_embeddings_batch(client, search_queries)
-            _, faiss_indices = index.faiss_index.search(q_vecs, k)
-            for row in faiss_indices:
-                for rank, child_idx in enumerate(row):
-                    cid = int(child_idx)
-                    if 0 <= cid < len(index.children):
-                        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (rrf_k + rank + 1)
+            q_vec = fetch_embeddings_batch(client, [search_query])
+            _, faiss_indices = index.faiss_index.search(q_vec, k)
+            for rank, child_idx in enumerate(faiss_indices[0]):
+                cid = int(child_idx)
+                if 0 <= cid < len(index.children):
+                    rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (rrf_k + rank + 1)
         except Exception as exc:
             print(f"Ошибка векторного поиска ({type(exc).__name__}), используем BM25", file=sys.stderr)
+
+    # Если оба поиска ничего не вернули, берем первые чанки как страховку
 
     if not rrf_scores:
         sorted_child_ids = list(range(min(k, len(index.children))))
     else:
         sorted_child_ids = sorted(rrf_scores.keys(), key=lambda cid: rrf_scores[cid], reverse=True)
 
-    # 3. Агрегация оценок дочерних чанков на уровень родительских документов
+
+    # 3. Агрегация оценок дочерних чанков на уровень родительских документов (Parent-Document)
     parent_scores: dict[int, float] = {}
     for cid in sorted_child_ids:
         pid = index.children[cid].parent_id
-        parent_scores[pid] = parent_scores.get(pid, 0.0) + rrf_scores.get(cid, 0.0)
+        score = rrf_scores.get(cid, 0.0)
+        if pid not in parent_scores:
+            parent_scores[pid] = score
+        else:
+            parent_scores[pid] = max(parent_scores[pid], score) + 0.15 * min(parent_scores[pid], score)
 
-    # Передаем топ-24 уникальных родительских блока в Qwen3 Reranker 8B
-    rerank_pool_size = max(RERANKER_TOP_N * 3, 24)
+    # Бустинг по номерам статей, договоров и кодам документов (например, 145, 70, юо-7, а-08)
+    codes = set(re.findall(r"(?:[а-яa-z]+-\d+|\b\d{2,4}(?:/\d{4})?\b)", search_query.lower()))
+    if codes:
+        for pid in parent_scores:
+            header_lower = index.parents[pid].header.lower()
+            for code in codes:
+                if code in header_lower:
+                    parent_scores[pid] += 0.08
+    # Берем топ-18 лучших уникальных родительских блоков для отправки в реранкер
+    rerank_pool_size = max(RERANKER_TOP_N * 3, 15)
     top_parent_ids = sorted(parent_scores.keys(), key=lambda pid: parent_scores[pid], reverse=True)[:rerank_pool_size]
     candidate_parents = [index.parents[pid] for pid in top_parent_ids]
 
-    # 4. Финальный реранкинг по объединенному поисковому запросу
-    rerank_query = " | ".join(search_queries) if len(search_queries) > 1 else primary_query
+    # 4. Финальный реранкинг через Qwen3 Reranker 8B
     try:
-        return rerank_parents(client, rerank_query, candidate_parents)
+        return rerank_parents(client, search_query, candidate_parents)
+
     except Exception as exc:
         print(f"Reranker недоступен ({type(exc).__name__}), возвращаем RRF-топ", file=sys.stderr)
         return candidate_parents[:RERANKER_TOP_N]
 
 
 SYSTEM_PROMPT = (
-    "Ты — юридический ассистент компании. Дай точный, фактологически безупречный и максимально лаконичный ответ "
+
+    "Ты — юридический ассистент компании. Дай точный, краткий и фактологически безупречный ответ "
     "на вопрос пользователя ИСКЛЮЧИТЕЛЬНО на основе предоставленных ниже фрагментов документов.\n\n"
     "Строгие правила:\n"
     "1. Запрещено использовать внешние знания, законы или статьи, которых нет в переданных фрагментах. "
     "Любой выдуманный факт или домысел недопустимы.\n"
-    "2. Если информации для ответа в фрагментах нет — напиши: «В базе знаний нет документов по данному вопросу, "
-    "поэтому ответить по документам я не могу. По памяти отвечать не буду, так как нормы могли измениться. "
-    "Для ответа обратитесь к юристу.» Если в тексте упомянуты другие статьи, которых нет в базе — прямо укажи, "
-    "что этих статей в базе нет.\n"
-    "3. Приоритет редакций: если в фрагментах есть несколько редакций одного регламента или закона, всегда применяй "
-    "самую свежую (действующую) редакцию, если только в вопросе прямо не указана дата события из прошлого.\n"
-    "4. Если пользователь в вопросе называет неверную цифру, срок или условие — прямо опровергни это со ссылкой на документ.\n"
-    "5. Формат ответа: ОДИН плотный абзац строго на 40–75 слов (без списков, заголовков и вводных фраз). "
-    "Если вопрос предполагает «да/нет», начни со слова «Да.» или «Нет.». В конце или в скобках укажи точный документ и пункт/статью.\n\n"
-    "Эталоны стиля:\n"
+
+    "2. Если информации для ответа в фрагментах нет — прямо напиши, что в базе знаний нет документов по этому вопросу, "
+    "и откажись отвечать по памяти. Если в фрагментах есть только часть норм (например, упомянуты другие статьи, "
+    "которых нет в тексте), укажи только то, что есть в базе, и отметь, каких статей/документов не хватает.\n"
+    "3. Если пользователь в вопросе называет неверную цифру, срок или условие — прямо опровергни это со ссылкой на документ.\n"
+    "4. Обращай внимание на даты и редакции документов: если вопрос касается события в прошлом, применяй редакцию регламента "
+    "или договора, действовавшую на ту дату.\n"
+    "5. Формат ответа: связный текст без списков (60–140 слов). Если вопрос предполагает «да/нет», "
+    "начни ответ со слова «Да.» или «Нет.». Обязательно укажи точный источник и пункт/статью.\n\n"
+    "Примеры эталонного стиля ответа:\n"
+
     "— Арендная плата по договору аренды № А-08/2024 с ООО «Северный Склад» — 450 000 рублей в месяц, включая НДС (п. 3.1). "
     "Вносится ежемесячно, не позднее 5-го числа текущего месяца (п. 3.2).\n"
     "— Да. Во время испытания на работника распространяются положения трудового законодательства, коллективного договора, "
@@ -683,12 +654,17 @@ SYSTEM_PROMPT = (
 )
 
 
+
+
 def generate_answer(client: httpx.Client, question: str, chunks: list[ParentChunk]) -> str:
-    """Генерирует эталонный краткий юридический ответ строго по отобранным фрагментам."""
+    """Генерирует юридически обоснованный ответ строго по отобранным родительским фрагментам."""
     if not chunks:
         return FALLBACK
 
-    context_blocks = [f"--- Фрагмент {i} ---\n{chunk.text}" for i, chunk in enumerate(chunks, 1)]
+    context_blocks = []
+    for i, chunk in enumerate(chunks, 1):
+        context_blocks.append(f"--- Фрагмент {i} ---\n{chunk.text}")
+
     context_str = "\n\n".join(context_blocks)
 
     payload = {
@@ -697,7 +673,12 @@ def generate_answer(client: httpx.Client, question: str, chunks: list[ParentChun
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": f"Контекст из базы знаний:\n{context_str}\n\nВопрос пользователя:\n{question}",
+
+                "content": (
+                    f"Контекст из базы знаний:\n{context_str}\n\n"
+                    f"Вопрос пользователя:\n{question}"
+                ),
+
             },
         ],
         "temperature": TEMPERATURE,
@@ -708,7 +689,10 @@ def generate_answer(client: httpx.Client, question: str, chunks: list[ParentChun
         result = post_with_retry(client, "/chat/completions", LLM_KEY, payload, retries=4)
         content = result["choices"][0]["message"].get("content", "")
         if isinstance(content, str) and content.strip():
-            cleaned = " ".join(content.strip().split())
+
+            # Убираем возможные markdown-артефакты в начале/конце и соблюдаем лимит 10 000 символов
+            cleaned = content.strip()
+
             if len(cleaned) > 9500:
                 cleaned = cleaned[:9500].rsplit(" ", 1)[0] + "..."
             return cleaned
@@ -716,7 +700,6 @@ def generate_answer(client: httpx.Client, question: str, chunks: list[ParentChun
         print(f"Ошибка генерации LLM: {type(exc).__name__}", file=sys.stderr)
 
     return FALLBACK
-
 
 def main() -> None:
     start_time = time.time()
