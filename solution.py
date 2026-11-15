@@ -62,7 +62,7 @@ RERANKER_MODEL = env("RERANKER_MODEL", "qwen/qwen3-reranker-8b")
 #расширил лимиты для качественного гибридного поиска
 RETRIEVAL_TOP_K = max(50, env_int("TOP_K", 50, 10, 150))
 RERANKER_TOP_N = max(8, env_int("RERANKER_TOP_N", 8, 3, 15))
-MAX_TOKENS = max(1200, env_int("MAX_TOKENS", 1200, 128, 8192))
+MAX_TOKENS = max(1200, env_int("MAX_TOKENS", 450, 128, 8192))
 MAX_WORKERS = env_int("MAX_WORKERS", 4, 1, 16)
 TEMPERATURE = env_float("TEMPERATURE", 0.0)
 CHUNKER = env("CHUNKER", "common")
@@ -236,15 +236,24 @@ class ChildChunk:
 
 #Регулярное выражение для поиска юредических заголовков 
 _KB_HEADINGS = [
-    (1, re.compile(r"^#\s+(.+)$")),
-    (2, re.compile(r"^#{2}\s+(.+)$")),
-    (3, re.compile(r"^#{3,6}\s+(.+)$")),
-    (1, re.compile(r"^(?:ЧАСТЬ|Часть)\s+[IVXLCDM\d]+.*$")),
-    (2, re.compile(r"^(?:ГЛАВА|Глава)\s+[IVXLCDM\d]+.*$")),
-    (3, re.compile(r"^(?:РАЗДЕЛ|Раздел)\s+[IVXLCDM\d]+.*$")),
-    (4, re.compile(r"^(?:Статья|Ст\.)\s*\d+(?:\.\d+)*\.?.*$")),
-    
+    # ===== Markdown-заголовки (самые явные) =====
+    (1, re.compile(r"^#\s+(.+)$")),          # # Заголовок
+    (2, re.compile(r"^#{2}\s+(.+)$")),        # ## Подзаголовок
+    (3, re.compile(r"^#{3,6}\s+(.+)$")),      # ### и глубже
+
+    # ===== Структура законов (иерархия: Раздел > Глава > Статья) =====
+    (1, re.compile(r"^(?:РАЗДЕЛ|Раздел)\s+[IVXLCDM\d]+.*$")),   # Раздел I / Раздел 1
+    (2, re.compile(r"^(?:ГЛАВА|Глава)\s+[IVXLCDM\d]+.*$")),     # Глава 1
+    (3, re.compile(r"^(?:Статья|Ст\.)\s*\d+(?:\.\d+)*\.?.*$")), # Статья 99 / Ст. 152
+
+    # ===== Разделы договоров: "1. Предмет договора", "10. Ответственность сторон" =====
+    # НЕ срабатывает на "1.1. Подпункт" (после первой точки нет пробела — там цифра)
+    (2, re.compile(r"^\d{1,2}\.\s+[А-ЯЁ][а-яёА-ЯЁ0-9\s,«»\-]{2,}$")),
+
+    # ===== Бонус: Приложения к договорам (опционально) =====
+    (2, re.compile(r"^(?:ПРИЛОЖЕНИЕ|Приложение)\s*\d+.*$", re.IGNORECASE)),
 ]
+
 
 
 def _kb_heading(line: str) -> tuple[int, str] | None:
@@ -672,12 +681,13 @@ def generate_answer(client: httpx.Client, question: str, chunks: list[ParentChun
         context_blocks.append(f"--- Фрагмент {i} ---\n{chunk.text}")
     context_str = "\n\n".join(context_blocks)
 
+    system_content = SYSTEM_PROMPT.replace("{context}", context_str)
     payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT.format(context=context_str)},
-            {"role": "user", "content": question},
-        ],
+    "model": LLM_MODEL,
+    "messages": [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": question},
+    ],
         "temperature": TEMPERATURE,
         "max_tokens": MAX_TOKENS,
     }
