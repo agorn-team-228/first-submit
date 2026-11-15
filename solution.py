@@ -62,7 +62,7 @@ RERANKER_MODEL = env("RERANKER_MODEL", "qwen/qwen3-reranker-8b")
 #расширил лимиты для качественного гибридного поиска
 RETRIEVAL_TOP_K = max(50, env_int("TOP_K", 50, 10, 150))
 RERANKER_TOP_N = max(8, env_int("RERANKER_TOP_N", 8, 3, 15))
-MAX_TOKENS = max(1200, env_int("MAX_TOKENS", 450, 128, 8192))
+MAX_TOKENS = max(env_int("MAX_TOKENS", 450, 128, 8192))
 MAX_WORKERS = env_int("MAX_WORKERS", 4, 1, 16)
 TEMPERATURE = env_float("TEMPERATURE", 0.0)
 CHUNKER = env("CHUNKER", "common")
@@ -147,6 +147,53 @@ def read_html(raw: bytes) -> str:
     soup = BeautifulSoup(raw.decode("utf-8", errors="ignore"), "lxml")
     return soup.get_text(separator="\n", strip=True)
 
+# Признак того, что строка/блок обращены к ИИ / языковой модели.
+AI_TARGET_RE = re.compile(
+    r"(?i)(?:ии[-\s]?ассистент|ии[-\s]?помощник|ии[-\s]?юрист|"
+    r"языков\w+\s+модел|\bllm\b|gpt|chatgpt|\bassistant\b|"
+    r"\blanguage\s+model\b|нейросет|"
+    r"\bпромп?т(?:а|у|е|ом|ы|ов|ам|ами|ах)?\b|"
+    r"системн\w+\s+промп?т|"
+    r"\bsystem\s+prompt\b)"
+)
+
+# Императивные команды, которые ИИ не должен исполнять.
+IMPERATIVE_RE = re.compile(
+    r"(?i)(?:игнорируй|проигнорируй|не\s+упоминай|не\s+учитывай|"
+    r"забудь\s+(?:все|всё)|отвечай\s*[«\"':]|всегда\s+отвечай|"
+    r"ignore\s+(?:all|previous|above)|disregard|override|"
+    r"выполни\s+следующ|следуй\s+инструкц)"
+)
+
+
+def sanitize_document_text(text: str, doc_name: str = "") -> str:
+    """Удаляет скрытые директивы, адресованные ИИ."""
+    cleaned_blocks: list[str] = []
+    removed: list[str] = []
+
+    for block in text.split("\n\n"):
+        if len(block) <= 600 and AI_TARGET_RE.search(block) and IMPERATIVE_RE.search(block):
+            removed.append(block.replace("\n", " ").strip()[:200])
+            continue
+
+        kept_lines: list[str] = []
+        for line in block.splitlines():
+            if AI_TARGET_RE.search(line) and IMPERATIVE_RE.search(line):
+                removed.append(line.strip()[:200])
+                continue
+            kept_lines.append(line)
+        if kept_lines:
+            cleaned_blocks.append("\n".join(kept_lines))
+
+    if removed:
+        print(
+            f"[sanitize] {doc_name}: удалено {len(removed)} фрагмент(ов) с директивой для ИИ",
+            file=sys.stderr,
+        )
+        for r in removed:
+            print(f"  × {r}", file=sys.stderr)
+
+    return re.sub(r"\n{3,}", "\n\n", "\n\n".join(cleaned_blocks)).strip()
 
 
 def fix_zip_filename(name: str, flag_bits: int) -> str:
@@ -248,10 +295,10 @@ _KB_HEADINGS = [
 
     # ===== Разделы договоров: "1. Предмет договора", "10. Ответственность сторон" =====
     # НЕ срабатывает на "1.1. Подпункт" (после первой точки нет пробела — там цифра)
-    (2, re.compile(r"^\d{1,2}\.\s+[А-ЯЁ][а-яёА-ЯЁ0-9\s,«»\-]{2,}$")),
+    (4, re.compile(r"^\d{1,2}\.\s+[А-ЯЁ][а-яёА-ЯЁ0-9\s,«»\-]{2,}$")),
 
     # ===== Бонус: Приложения к договорам (опционально) =====
-    (2, re.compile(r"^(?:ПРИЛОЖЕНИЕ|Приложение)\s*\d+.*$", re.IGNORECASE)),
+    (4, re.compile(r"^(?:ПРИЛОЖЕНИЕ|Приложение)\s*\d+.*$", re.IGNORECASE)),
 ]
 
 
@@ -415,6 +462,7 @@ def post_with_retry(
                     request=response.request,
                     response=response,
                 )
+            
             response.raise_for_status()
             return response.json()
         except Exception as exc:
